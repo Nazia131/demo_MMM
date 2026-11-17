@@ -228,14 +228,47 @@ class AudioEncoder:
         print(f"[CHEM][audio_encoder] encode() path={audio_path}")
 
         # --- Transcription ---------------------------------------------------
+        # Failures here used to be swallowed, which looked like "audio is
+        # silent / harmless".  Every problem is now collected in ``warnings``
+        # and returned so the API/UI can show it.
         transcript = ""
         language = "unknown"
+        warnings: List[str] = []
+
+        # Decode ourselves (soundfile/librosa) and hand Whisper a 16 kHz mono
+        # array.  Whisper's own file loader shells out to the ``ffmpeg``
+        # binary and raises if it is not installed; this avoids that for
+        # wav/flac/ogg and most mp3 files.
+        audio_input: Any = audio_path
         try:
-            result = self._whisper.transcribe(audio_path)
+            import librosa
+
+            samples, _sr = librosa.load(audio_path, sr=16000, mono=True)
+            if samples is not None and len(samples) > 0:
+                audio_input = samples
+            else:
+                warnings.append("the audio file decoded to zero samples (empty file?).")
+        except Exception as exc:
+            warnings.append(
+                f"could not decode the file with librosa ({type(exc).__name__}: {exc}); "
+                "falling back to Whisper's ffmpeg loader."
+            )
+
+        try:
+            result = self._whisper.transcribe(
+                audio_input,
+                fp16=(self.device == "cuda"),
+            )
             transcript = (result.get("text") or "").strip()
             language = result.get("language", "unknown")
+            if not transcript:
+                warnings.append("no speech was detected in the audio.")
         except Exception as exc:
-            print(f"[CHEM][audio_encoder] Whisper transcription failed: {exc}")
+            msg = f"{type(exc).__name__}: {exc}"
+            if "ffmpeg" in msg.lower() or isinstance(exc, FileNotFoundError):
+                msg += " -- install ffmpeg (https://ffmpeg.org) or upload a .wav file."
+            warnings.append(f"transcription failed: {msg}")
+            print(f"[CHEM][audio_encoder] Whisper transcription failed: {msg}")
 
         # --- Transcript toxicity via the reused TextEncoder ------------------
         text_result = self._text_encoder.encode(transcript) if transcript else {
@@ -249,6 +282,10 @@ class AudioEncoder:
             features = self._extract_acoustic_features(audio_path)
         except Exception as exc:
             print(f"[CHEM][audio_encoder] Acoustic extraction failed: {exc}")
+            warnings.append(
+                f"acoustic analysis failed ({type(exc).__name__}: {exc}); "
+                "only the transcript was scored."
+            )
             features = {
                 "rms_energy": 0.0,
                 "spectral_centroid": 0.0,
@@ -265,7 +302,12 @@ class AudioEncoder:
         duration = float(features.get("duration", 0.0))
 
         # --- Blend into a single harm score ---------------------------------
-        harm_score = self._w_transcript * transcript_harm + self._w_acoustic * acoustic_harm
+        # What is *said* is the evidence; a loud or agitated voice only adds to
+        # it.  Taking the max with the transcript score stops a clearly toxic
+        # transcript spoken calmly from being diluted to 0.7x (which could
+        # fall under the scorer's audio cut-off).
+        blended = self._w_transcript * transcript_harm + self._w_acoustic * acoustic_harm
+        harm_score = max(transcript_harm, blended)
 
         # --- Build elements (all with temporal_position) --------------------
         elements: List[Dict[str, Any]] = []
@@ -321,5 +363,6 @@ class AudioEncoder:
             "transcript": transcript,
             "language": language,
             "acoustic_features": features,
+            "warnings": warnings,
             "modality": self.modality,
         }

@@ -401,6 +401,21 @@ canvas#graph{background:var(--s1);border:1px solid var(--border);flex:1;min-heig
       <div class="r-val" id="r-evidence" style="font-size:11px;color:var(--muted)"><span class="r-dash">—</span></div>
     </div>
 
+    <div class="right-block" id="blk-ocr" style="display:none">
+      <div class="r-label">TEXT READ FROM IMAGE (OCR)</div>
+      <div class="expl-text" id="r-ocr" style="color:var(--text);word-break:break-word"></div>
+    </div>
+
+    <div class="right-block" id="blk-transcript" style="display:none">
+      <div class="r-label">AUDIO TRANSCRIPT</div>
+      <div class="expl-text" id="r-transcript" style="color:var(--text);word-break:break-word"></div>
+    </div>
+
+    <div class="right-block" id="blk-warn" style="display:none">
+      <div class="r-label" style="color:var(--amber)">WARNINGS</div>
+      <div class="expl-text" id="r-warn" style="color:var(--amber);word-break:break-word"></div>
+    </div>
+
     <div class="explanation-block">
       <div class="r-label">EXPLANATION</div>
       <div class="expl-text" id="r-expl">Awaiting analysis…</div>
@@ -480,7 +495,12 @@ async function health() {
     const d = await r.json();
     const ok = d.models_loaded;
     document.getElementById('sdot').className = 'status-dot ' + (ok ? 'online' : 'err');
-    document.getElementById('stxt').textContent = ok ? 'online — models loaded' : 'degraded — ' + (d.error||'loading');
+    const off = [];
+    if (ok && d.ocr_available === false) off.push('OCR off');
+    if (ok && d.audio_available === false) off.push('audio off');
+    document.getElementById('stxt').textContent = ok
+      ? 'online — models loaded' + (off.length ? ' (' + off.join(', ') + ')' : '')
+      : 'degraded — ' + (d.error||'loading');
   } catch {
     document.getElementById('sdot').className = 'status-dot err';
     document.getElementById('stxt').textContent = 'offline — start app.py';
@@ -712,6 +732,17 @@ function renderResult(d) {
   const re=document.getElementById('r-evidence');
   const els=d.triggered_elements||[];
   re.textContent=els.length?`${els.length} element(s) triggered`:'none';
+
+  // Extracted text / transcript / warnings (textContent only: this text comes
+  // from user-supplied images and audio, so it is never injected as HTML).
+  const showBlock=(blk,el,val)=>{
+    document.getElementById(blk).style.display = val ? 'block' : 'none';
+    document.getElementById(el).textContent = val || '';
+  };
+  showBlock('blk-ocr','r-ocr', d.ocr_text);
+  showBlock('blk-transcript','r-transcript', d.transcript);
+  showBlock('blk-warn','r-warn', (d.warnings||[]).join('\n'));
+  document.getElementById('r-warn').style.whiteSpace='pre-line';
 
   // Explanation
   document.getElementById('r-expl').textContent = d.explanation||'No explanation returned.';

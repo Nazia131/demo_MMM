@@ -259,7 +259,9 @@
     "gat_vs_pattern_weight": 0.7,
     "pattern_similarity_weight": 0.3,
     "co_occurrence_window": 2,
-    "acoustic_agitation_sigma_ratio": 1.0
+    "acoustic_agitation_sigma_ratio": 1.0,
+    "ocr_min_confidence": 0.3,
+    "ocr_min_chars": 3
   },
 
   "node_types": ["text", "image", "audio", "video", "action"],
