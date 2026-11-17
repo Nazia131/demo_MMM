@@ -154,7 +154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"accuracy : {m['accuracy']:.1%}")
     print(f"precision: {m['precision']:.1%}   recall: {m['recall']:.1%}   F1: {m['f1']:.3f}")
     print("\nconfusion (rows = expected, cols = predicted)")
-    print(f"              HARMFUL   SAFE")
+    print("              HARMFUL   SAFE")
     print(f"  HARMFUL     {m['tp']:>7}  {m['fn']:>5}   <- misses here are false negatives")
     print(f"  SAFE        {m['fp']:>7}  {m['tn']:>5}   <- misses here are false positives")
 
