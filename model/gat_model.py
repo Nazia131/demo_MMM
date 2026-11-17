@@ -16,7 +16,7 @@ Architecture (fixed by the CHEM design spec / INTERFACES.md)
   concatenated heads (=> 2048-d), followed by an ELU non-linearity.
 * ``GATConv`` layer 2: ``in=2048``, ``out=2``, ``heads=1``, ``concat=False``,
   ``dropout=0.6``.
-* ``global_mean_pool`` collapses node embeddings to one vector per graph.
+* mean- and max-pooling (``global_mean_pool`` ‖ ``global_max_pool``) collapse node states to one vector per graph.
 * A final ``Linear`` classification head maps the pooled representation to two
   logits, returned as ``log_softmax`` (class 0 = SAFE, class 1 = HARMFUL).
 
@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GATConv, global_mean_pool
+from torch_geometric.nn import GATConv, global_max_pool, global_mean_pool
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,7 @@ GAT_HIDDEN_CHANNELS: int = 256   # per-head output width of layer 1
 GAT_HEADS: int = 8               # attention heads in layer 1
 GAT_NUM_CLASSES: int = 2         # SAFE (0) / HARMFUL (1)
 GAT_DROPOUT: float = 0.3         # dropout applied inside both GATConv layers
+GAT_OUT_CHANNELS: int = 128      # layer-2 width feeding the pooled readout/MLP head
 
 
 def _embedding_dim_from_config() -> Optional[int]:
@@ -100,7 +101,7 @@ class CHEMGraphAttentionNetwork(nn.Module):
     num_classes : int, optional
         Number of output classes (default 2).
     dropout : float, optional
-        Dropout probability used inside both GAT layers (default 0.6).
+        Dropout probability used inside both GAT layers (default 0.3).
 
     Attributes
     ----------
@@ -150,17 +151,30 @@ class CHEMGraphAttentionNetwork(nn.Module):
             concat=True,
         )
 
-        # Layer 2: single-head attention collapsing to `num_classes` features.
+        # Layer 2: single-head attention to a GAT_OUT_CHANNELS-wide node state
+        # (not straight to 2 classes: that made a 2-d bottleneck before the head).
+        self.out_channels = GAT_OUT_CHANNELS
         self.gat2 = GATConv(
             in_channels=self.hidden_channels * self.heads,
-            out_channels=self.num_classes,
+            out_channels=self.out_channels,
             heads=1,
             concat=False,
             dropout=self.dropout,
         )
 
-        # Classification head over the mean-pooled graph representation.
-        self.classifier = nn.Linear(self.num_classes, self.num_classes)
+        # MLP head over [mean-pool ‖ max-pool] of the node states.  Max pooling
+        # keeps a single strongly harmful node from being averaged away.
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * self.out_channels, self.out_channels),
+            nn.ELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.out_channels, self.num_classes),
+        )
+
+    @staticmethod
+    def _readout(h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        """Concatenate mean- and max-pooled node states per graph."""
+        return torch.cat([global_mean_pool(h, batch), global_max_pool(h, batch)], dim=-1)
 
     def forward(
         self,
@@ -200,7 +214,7 @@ class CHEMGraphAttentionNetwork(nn.Module):
         h = self.gat2(h, edge_index)
 
         # --- Readout: mean-pool nodes -> one vector per graph. --------------
-        pooled = global_mean_pool(h, batch)
+        pooled = self._readout(h, batch)
 
         # --- Classification head + log-softmax. -----------------------------
         logits = self.classifier(pooled)
@@ -251,7 +265,7 @@ class CHEMGraphAttentionNetwork(nn.Module):
             h, edge_index, return_attention_weights=True
         )
 
-        pooled = global_mean_pool(h, batch)
+        pooled = self._readout(h, batch)
         logits = self.classifier(pooled)
         log_probs = F.log_softmax(logits, dim=-1)
 

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 _ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -21,8 +23,12 @@ _GRAPH_SHAPING_FILES = (
     "encoders/text_encoder.py",
     "encoders/image_encoder.py",
     "graph/graph_builder.py",
+    "utils/embeddings.py",
     "policy/policy_config.json",
 )
+
+# Bump when the graphs' stored attributes change (e.g. new ``group_id`` field).
+_CACHE_VERSION = "2"
 
 
 # ------------------------------------------------------------------ weights
@@ -83,6 +89,7 @@ def best_threshold(
 def graph_cache_key(samples: Sequence[Dict[str, Any]], root: str = _ROOT) -> str:
     """Fingerprint of the samples plus the files that shape a graph."""
     h = hashlib.sha256()
+    h.update(_CACHE_VERSION.encode())
     for s in samples:
         h.update(repr((s.get("id"), s.get("img"), s.get("text"), s.get("label"))).encode("utf-8"))
     for rel in _GRAPH_SHAPING_FILES:
@@ -139,3 +146,123 @@ def subsample(samples: List[Dict[str, Any]], max_samples: Optional[int], seed: i
     idx = list(range(len(samples)))
     random.Random(seed).shuffle(idx)
     return [samples[i] for i in sorted(idx[:max_samples])]
+
+
+# ----------------------------------------------------------------- cleaning
+def clean_text(text: Any) -> str:
+    """Normalise caption text: NFKC, drop control chars, collapse whitespace."""
+    s = unicodedata.normalize("NFKC", "" if text is None else str(text))
+    s = "".join(ch for ch in s if ch in "\n\t " or unicodedata.category(ch)[0] != "C")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _text_key(text: str) -> str:
+    return clean_text(text).casefold()
+
+
+def _img_key(img: Any) -> str:
+    return os.path.basename(img).casefold() if isinstance(img, str) and img else ""
+
+
+def prepare_samples(samples: Sequence[Dict[str, Any]]) -> tuple:
+    """Clean raw samples; returns ``(clean_samples, stats)``.
+
+    * label must be 0/1 (drops unlabeled rows, e.g. ``-1`` from blind splits),
+    * a non-empty ``img`` path that does not exist is dropped (otherwise the
+      meme silently becomes text-only while keeping its image-dependent label),
+    * captions are cleaned with :func:`clean_text`,
+    * exact duplicates (same cleaned text + image file name) keep the first copy.
+    """
+    stats = {"input": len(samples), "bad_label": 0, "missing_image": 0, "duplicate": 0}
+    seen, out = set(), []
+    for s in samples:
+        try:
+            label = int(s.get("label", -1))
+        except (TypeError, ValueError):
+            label = -1
+        if label not in (0, 1):
+            stats["bad_label"] += 1
+            continue
+        img = s.get("img")
+        if isinstance(img, str) and img and not os.path.isfile(img):
+            stats["missing_image"] += 1
+            continue
+        text = clean_text(s.get("text"))
+        key = (_text_key(text), _img_key(img))
+        if key in seen:
+            stats["duplicate"] += 1
+            continue
+        seen.add(key)
+        out.append({**s, "text": text, "label": label})
+    stats["kept"] = len(out)
+    return out, stats
+
+
+def assign_groups(samples: Sequence[Dict[str, Any]]) -> List[int]:
+    """Group id per sample: samples sharing a caption OR an image are linked.
+
+    Hateful Memes ships "confounder" pairs (same text/different image and vice
+    versa); a random split would put near-twins in both train and test and
+    inflate scores, so splits are done per group.
+    """
+    parent = list(range(len(samples)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first: Dict[Any, int] = {}
+    for i, s in enumerate(samples):
+        for key in (("t", _text_key(s.get("text", ""))), ("i", _img_key(s.get("img")))):
+            if not key[1]:
+                continue
+            if key in first:
+                parent[find(i)] = find(first[key])
+            else:
+                first[key] = i
+    return [find(i) for i in range(len(samples))]
+
+
+def stratified_group_split(
+    labels: Sequence[int],
+    groups: Sequence[int],
+    fractions: Sequence[float] = (0.70, 0.15, 0.15),
+    seed: int = 42,
+) -> List[List[int]]:
+    """Split indices into ``len(fractions)`` parts keeping each group intact and
+    the harmful/safe ratio of every part close to the overall ratio."""
+    import random
+
+    n_split = len(fractions)
+    by_group: Dict[int, List[int]] = {}
+    for i, g in enumerate(groups):
+        by_group.setdefault(g, []).append(i)
+    items = list(by_group.values())
+    rng = random.Random(seed)
+    rng.shuffle(items)
+    items.sort(key=len, reverse=True)  # big groups first, ties stay shuffled
+
+    total = len(labels)
+    total_pos = sum(int(l) == 1 for l in labels)
+    tgt_n = [f * total for f in fractions]
+    tgt_pos = [f * total_pos for f in fractions]
+    tgt_neg = [a - b for a, b in zip(tgt_n, tgt_pos)]
+    cur_pos, cur_neg = [0] * n_split, [0] * n_split
+    parts: List[List[int]] = [[] for _ in range(n_split)]
+
+    for idxs in items:
+        pos = sum(int(labels[i]) == 1 for i in idxs)
+        neg = len(idxs) - pos
+        best, best_score = 0, None
+        for s in range(n_split):
+            need_pos = (tgt_pos[s] - cur_pos[s]) / max(tgt_pos[s], 1.0)
+            need_neg = (tgt_neg[s] - cur_neg[s]) / max(tgt_neg[s], 1.0)
+            score = (pos * need_pos + neg * need_neg) / len(idxs)
+            if best_score is None or score > best_score:
+                best, best_score = s, score
+        parts[best].extend(idxs)
+        cur_pos[best] += pos
+        cur_neg[best] += neg
+    return [sorted(p) for p in parts]
