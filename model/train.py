@@ -10,10 +10,12 @@ Pipeline
 1. **Load** Hateful Memes samples via ``data.preprocess.hateful_memes``.
 2. **Encode** each sample with the CHEM text + image encoders (loaded once).
 3. **Build** a PyG ``Data`` graph per sample via ``graph.graph_builder.build_graph``.
-4. **Split** 70 / 15 / 15 into train / val / test and batch with PyG ``DataLoader``.
+4. **Clean + split**: drop unlabeled/missing-image/duplicate rows, then a
+   stratified 70 / 15 / 15 split that keeps caption/image twins together.
 5. **Train** with ``NLLLoss`` on the model's ``log_softmax`` output (equivalent to
-   BCE for the 2-class case), Adam (``lr=0.005``, ``weight_decay=5e-4``), with
-   early stopping (patience 20) on validation F1; the best checkpoint is saved to
+   BCE for the 2-class case), Adam (``lr=0.001``, ``weight_decay=5e-4``, grad-clip 1.0,
+   LR halved on validation plateau), with early stopping (patience 20) on
+   validation AUC; the best checkpoint is saved to
    ``model/checkpoints/best_gat.pt``.
 6. **Log** every metric to Weights & Biases (guarded so training still runs if
    W&B is offline / unavailable).
@@ -53,6 +55,8 @@ _BEST_CHECKPOINT_PATH = os.path.join(_CHECKPOINT_DIR, "best_gat.pt")
 _LEARNING_RATE = 0.001
 _WEIGHT_DECAY = 5e-4
 _EARLY_STOP_PATIENCE = 20
+_GRAD_CLIP = 1.0
+_SEED = 42
 
 # Built graphs are cached here (keyed by a fingerprint, see model.train_utils).
 _DEFAULT_CACHE_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "cache"))
@@ -171,6 +175,7 @@ def _build_dataset(
             # --- Build the Content Composition Graph. -----------------------
             graph_dict = build_graph(elements, label)
             data = graph_dict["data"]
+            data.group_id = torch.tensor([int(sample.get("group", i))], dtype=torch.long)
             dataset.append(data)
         except Exception as exc:  # pragma: no cover - never let one bad sample stop training
             print(f"[CHEM][train] skipping sample {sample.get('id', i)}: {exc}")
@@ -182,31 +187,19 @@ def _build_dataset(
 
 
 def _split_dataset(dataset: List[Any], seed: int = 42) -> Dict[str, List[Any]]:
-    """Shuffle and split a graph list 70 / 15 / 15 into train / val / test.
-
-    Parameters
-    ----------
-    dataset : list
-        List of PyG ``Data`` graphs.
-    seed : int, optional
-        RNG seed for a reproducible shuffle (default 42).
-
-    Returns
-    -------
-    dict
-        ``{"train": [...], "val": [...], "test": [...]}``.
-    """
-    import random
-
-    shuffled = list(dataset)
-    random.Random(seed).shuffle(shuffled)
-    n = len(shuffled)
-    n_train = int(0.70 * n)
-    n_val = int(0.15 * n)
+    """Stratified 70 / 15 / 15 train / val / test split that never separates
+    graphs sharing a ``group_id`` (caption/image twins).  Graphs without a
+    ``group_id`` (old caches) are treated as their own group."""
+    labels = [int(g.y.view(-1)[0]) for g in dataset]
+    groups = [
+        int(g.group_id.view(-1)[0]) if getattr(g, "group_id", None) is not None else -(i + 1)
+        for i, g in enumerate(dataset)
+    ]
+    tr, va, te = train_utils.stratified_group_split(labels, groups, (0.70, 0.15, 0.15), seed)
     return {
-        "train": shuffled[:n_train],
-        "val": shuffled[n_train : n_train + n_val],
-        "test": shuffled[n_train + n_val :],
+        "train": [dataset[i] for i in tr],
+        "val": [dataset[i] for i in va],
+        "test": [dataset[i] for i in te],
     }
 
 
@@ -338,6 +331,7 @@ def _train_one_epoch(model, loader, optimizer, criterion, device) -> float:
         log_probs = model(batch.x.float(), batch.edge_index, batch.batch)
         loss = criterion(log_probs, batch.y.view(-1).long())
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), _GRAD_CLIP)
         optimizer.step()
         total_loss += float(loss.item())
         n_batches += 1
@@ -387,6 +381,11 @@ def train(
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[CHEM][train] Using device: {device}")
+    import random
+    random.seed(_SEED)
+    torch.manual_seed(_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_SEED)
 
     # --- Weights & Biases (guarded so offline / missing wandb never crashes). -
     wandb = _init_wandb(wandb_project, epochs, batch_size)
@@ -400,7 +399,14 @@ def train(
     if not samples:
         print("[CHEM][train] ERROR: no samples available; aborting training.")
         return None
+    samples, clean_stats = train_utils.prepare_samples(samples)
+    print(f"[CHEM][train] Cleaning: {clean_stats}")
+    if not samples:
+        print("[CHEM][train] ERROR: no valid samples after cleaning; aborting training.")
+        return None
     samples = train_utils.subsample(samples, max_samples)
+    for _s, _g in zip(samples, train_utils.assign_groups(samples), strict=True):
+        _s["group"] = _g
     if max_samples:
         print(f"[CHEM][train] --max-samples: using {len(samples)} samples.")
 
@@ -449,16 +455,15 @@ def train(
         print(f"[CHEM][train] class weights (safe, harmful) = {weights[0]:.3f}, {weights[1]:.3f}")
         criterion = nn.NLLLoss(weight=torch.tensor(weights, dtype=torch.float, device=device))
     else:
-        _ys = torch.tensor([int(d.y.view(-1)[0]) for d in splits['train']])
-        _pos = max(int((_ys == 1).sum()), 1)
-        _neg = max(int((_ys == 0).sum()), 1)
-        _w = torch.tensor([len(_ys) / (2.0 * _neg), len(_ys) / (2.0 * _pos)], dtype=torch.float)
-        criterion = nn.NLLLoss(weight=_w.to(device))
+        criterion = nn.NLLLoss()
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
     os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
 
-    # --- Training loop with early stopping on validation F1. ---------------
-    best_val_f1 = -1.0
+    # --- Training loop with early stopping on validation AUC. --------------
+    best_val_auc = -1.0
     epochs_without_improvement = 0
     print("[CHEM][train] Starting training ...")
     for epoch in range(1, epochs + 1):
@@ -467,12 +472,14 @@ def train(
         val_metrics = val_eval["metrics"]
         val_f1 = val_metrics.get("f1", 0.0)
         _auc = val_metrics.get("auc")
-        val_select = _auc if (_auc is not None and _auc == _auc) else val_f1  # AUC, not F1
+        val_select = _auc if (_auc is not None and _auc == _auc) else val_f1
+        scheduler.step(val_select)
 
         print(
             f"[CHEM][train] epoch {epoch:3d}/{epochs} | "
             f"train_loss={train_loss:.4f} | val_loss={val_eval['loss']:.4f} | "
-            f"val_f1={val_f1:.4f} | val_acc={val_metrics.get('accuracy', 0.0):.4f}"
+            f"val_auc={val_select:.4f} | val_f1={val_f1:.4f} | "
+            f"val_acc={val_metrics.get('accuracy', 0.0):.4f}"
         )
 
         _wandb_log(
@@ -486,15 +493,15 @@ def train(
         )
 
         # Checkpoint + early-stopping bookkeeping.
-        if val_select > best_val_f1:
-            best_val_f1 = val_select
+        if val_select > best_val_auc:
+            best_val_auc = val_select
             epochs_without_improvement = 0
             torch.save(
-                {"state_dict": model.state_dict(), "val_f1": best_val_f1, "epoch": epoch},
+                {"state_dict": model.state_dict(), "val_auc": best_val_auc, "val_f1": val_f1, "epoch": epoch},
                 _BEST_CHECKPOINT_PATH,
             )
             print(
-                f"[CHEM][train] new best val_f1={best_val_f1:.4f}; "
+                f"[CHEM][train] new best val_auc={best_val_auc:.4f}; "
                 f"saved -> {_BEST_CHECKPOINT_PATH}"
             )
         else:
@@ -502,7 +509,7 @@ def train(
             if epochs_without_improvement >= _EARLY_STOP_PATIENCE:
                 print(
                     f"[CHEM][train] early stopping at epoch {epoch} "
-                    f"(no val F1 improvement in {_EARLY_STOP_PATIENCE} epochs)."
+                    f"(no val AUC improvement in {_EARLY_STOP_PATIENCE} epochs)."
                 )
                 break
 
