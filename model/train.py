@@ -50,7 +50,7 @@ _CHECKPOINT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "chec
 _BEST_CHECKPOINT_PATH = os.path.join(_CHECKPOINT_DIR, "best_gat.pt")
 
 # Training hyper-parameters fixed by the CHEM spec / INTERFACES.md.
-_LEARNING_RATE = 0.005
+_LEARNING_RATE = 0.001
 _WEIGHT_DECAY = 5e-4
 _EARLY_STOP_PATIENCE = 20
 
@@ -449,7 +449,11 @@ def train(
         print(f"[CHEM][train] class weights (safe, harmful) = {weights[0]:.3f}, {weights[1]:.3f}")
         criterion = nn.NLLLoss(weight=torch.tensor(weights, dtype=torch.float, device=device))
     else:
-        criterion = nn.NLLLoss()
+        _ys = torch.tensor([int(d.y.view(-1)[0]) for d in splits['train']])
+        _pos = max(int((_ys == 1).sum()), 1)
+        _neg = max(int((_ys == 0).sum()), 1)
+        _w = torch.tensor([len(_ys) / (2.0 * _neg), len(_ys) / (2.0 * _pos)], dtype=torch.float)
+        criterion = nn.NLLLoss(weight=_w.to(device))
 
     os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
 
@@ -462,6 +466,8 @@ def train(
         val_eval = _evaluate(model, val_loader, device)
         val_metrics = val_eval["metrics"]
         val_f1 = val_metrics.get("f1", 0.0)
+        _auc = val_metrics.get("auc")
+        val_select = _auc if (_auc is not None and _auc == _auc) else val_f1  # AUC, not F1
 
         print(
             f"[CHEM][train] epoch {epoch:3d}/{epochs} | "
@@ -480,8 +486,8 @@ def train(
         )
 
         # Checkpoint + early-stopping bookkeeping.
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_select > best_val_f1:
+            best_val_f1 = val_select
             epochs_without_improvement = 0
             torch.save(
                 {"state_dict": model.state_dict(), "val_f1": best_val_f1, "epoch": epoch},
