@@ -49,3 +49,6 @@ wandb/
 # Temp
 *.tmp
 *.log
+
+# Graph caches
+model/cache/

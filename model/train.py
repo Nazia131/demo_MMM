@@ -10,11 +10,12 @@ Pipeline
 1. **Load** Hateful Memes samples via ``data.preprocess.hateful_memes``.
 2. **Encode** each sample with the CHEM text + image encoders (loaded once).
 3. **Build** a PyG ``Data`` graph per sample via ``graph.graph_builder.build_graph``.
-4. **Split** official TRAIN into train / val (stratified, caption-grouped); the
-   official DEV split is the untouched held-out test.  Batch with PyG ``DataLoader``.
+4. **Clean + split**: drop unlabeled/missing-image/duplicate rows, then a
+   stratified 70 / 15 / 15 split that keeps caption/image twins together.
 5. **Train** with ``NLLLoss`` on the model's ``log_softmax`` output (equivalent to
-   BCE for the 2-class case), Adam (``lr=0.005``, ``weight_decay=5e-4``), with
-   early stopping (patience 20) on validation ROC-AUC; the best checkpoint is saved to
+   BCE for the 2-class case), Adam (``lr=0.001``, ``weight_decay=5e-4``, grad-clip 1.0,
+   LR halved on validation plateau), with early stopping (patience 20) on
+   validation AUC; the best checkpoint is saved to
    ``model/checkpoints/best_gat.pt``.
 6. **Log** every metric to Weights & Biases (guarded so training still runs if
    W&B is offline / unavailable).
@@ -51,9 +52,11 @@ _CHECKPOINT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "chec
 _BEST_CHECKPOINT_PATH = os.path.join(_CHECKPOINT_DIR, "best_gat.pt")
 
 # Training hyper-parameters fixed by the CHEM spec / INTERFACES.md.
-_LEARNING_RATE = 0.005
+_LEARNING_RATE = 0.001
 _WEIGHT_DECAY = 5e-4
 _EARLY_STOP_PATIENCE = 20
+_GRAD_CLIP = 1.0
+_SEED = 42
 
 # Built graphs are cached here (keyed by a fingerprint, see model.train_utils).
 _DEFAULT_CACHE_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "cache"))
@@ -172,6 +175,8 @@ def _build_dataset(
             # --- Build the Content Composition Graph. -----------------------
             graph_dict = build_graph(elements, label)
             data = graph_dict["data"]
+            data.group_id = torch.tensor([int(sample.get("group", i))], dtype=torch.long)
+            data.is_dev = torch.tensor([1 if sample.get("is_dev") else 0], dtype=torch.long)
             dataset.append(data)
         except Exception as exc:  # pragma: no cover - never let one bad sample stop training
             print(f"[CHEM][train] skipping sample {sample.get('id', i)}: {exc}")
@@ -182,75 +187,34 @@ def _build_dataset(
     return dataset
 
 
-def _seed_everything(seed: int = 42) -> None:
-    """Seed Python, NumPy and PyTorch so a training run is repeatable."""
-    import random
-
-    import numpy as np
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():  # pragma: no cover - CPU-only in CI
-        torch.cuda.manual_seed_all(seed)
-
-
-def _graph_group_key(graph: Any, fallback: int) -> str:
-    """Caption of a graph's first text node (siblings share a caption)."""
-    for meta in getattr(graph, "node_meta", None) or []:
-        if meta.get("type") == "text":
-            return str(meta.get("full_label", "")).strip().lower() or f"_g{fallback}"
-    return f"_g{fallback}"
-
-
-def _split_train_val(dataset: List[Any], val_frac: float = 0.15, seed: int = 42) -> Dict[str, List[Any]]:
-    """Stratified, caption-grouped train / val split of the TRAIN graphs only.
-
-    The official ``dev`` split is never part of this split: it is built
-    separately and used only as the final held-out test.
-    """
-    import numpy as np
-    from sklearn.model_selection import StratifiedGroupKFold
-
-    y = np.asarray([int(g.y.view(-1)[0]) for g in dataset])
-    keys = [_graph_group_key(g, i) for i, g in enumerate(dataset)]
-    ids = {k: n for n, k in enumerate(dict.fromkeys(keys))}
-    groups = np.asarray([ids[k] for k in keys])
-    n_splits = max(2, int(round(1.0 / val_frac)))
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    tr, va = next(sgkf.split(np.zeros(len(y)), y, groups))
-    return {"train": [dataset[i] for i in sorted(tr)], "val": [dataset[i] for i in sorted(va)]}
+def _split_with_dev_holdout(dataset: List[Any], seed: int = 42) -> Dict[str, List[Any]]:
+    """train/val (85/15, grouped, stratified) from TRAIN graphs only; the dev
+    graphs become ``test``. Falls back to the 70/15/15 split when there is no dev."""
+    is_dev = [bool(getattr(g, "is_dev", None) is not None and int(g.is_dev.view(-1)[0])) for g in dataset]
+    dev = [g for g, d in zip(dataset, is_dev) if d]
+    tr_all = [g for g, d in zip(dataset, is_dev) if not d]
+    if not dev:
+        return _split_dataset(tr_all, seed)
+    labels = [int(g.y.view(-1)[0]) for g in tr_all]
+    groups = [int(g.group_id.view(-1)[0]) for g in tr_all]
+    tr, va = train_utils.stratified_group_split(labels, groups, (0.85, 0.15), seed)
+    return {"train": [tr_all[i] for i in tr], "val": [tr_all[i] for i in va], "test": dev}
 
 
 def _split_dataset(dataset: List[Any], seed: int = 42) -> Dict[str, List[Any]]:
-    """Shuffle and split a graph list 70 / 15 / 15 into train / val / test.
-
-    NOTE: only ever pass TRAIN-split graphs here (ablation / metrics tooling).
-    :func:`train` itself uses :func:`_split_train_val` and the real dev split.
-
-    Parameters
-    ----------
-    dataset : list
-        List of PyG ``Data`` graphs.
-    seed : int, optional
-        RNG seed for a reproducible shuffle (default 42).
-
-    Returns
-    -------
-    dict
-        ``{"train": [...], "val": [...], "test": [...]}``.
-    """
-    import random
-
-    shuffled = list(dataset)
-    random.Random(seed).shuffle(shuffled)
-    n = len(shuffled)
-    n_train = int(0.70 * n)
-    n_val = int(0.15 * n)
+    """Stratified 70 / 15 / 15 train / val / test split that never separates
+    graphs sharing a ``group_id`` (caption/image twins).  Graphs without a
+    ``group_id`` (old caches) are treated as their own group."""
+    labels = [int(g.y.view(-1)[0]) for g in dataset]
+    groups = [
+        int(g.group_id.view(-1)[0]) if getattr(g, "group_id", None) is not None else -(i + 1)
+        for i, g in enumerate(dataset)
+    ]
+    tr, va, te = train_utils.stratified_group_split(labels, groups, (0.70, 0.15, 0.15), seed)
     return {
-        "train": shuffled[:n_train],
-        "val": shuffled[n_train : n_train + n_val],
-        "test": shuffled[n_train + n_val :],
+        "train": [dataset[i] for i in tr],
+        "val": [dataset[i] for i in va],
+        "test": [dataset[i] for i in te],
     }
 
 
@@ -278,10 +242,7 @@ def _compute_metrics(y_true: List[int], y_prob: List[float]) -> Dict[str, float]
     try:
         from evaluate.metrics import compute_metrics
 
-        # Explicit 0.5: compute_metrics() otherwise defaults to the policy
-        # threshold (0.35), which made "threshold 0.50" logs and F1-based
-        # checkpoint selection silently use a recall-favouring cut-off.
-        return compute_metrics(y_true, y_prob, threshold=0.5)
+        return compute_metrics(y_true, y_prob)
     except Exception:
         pass  # fall through to sklearn
 
@@ -385,6 +346,7 @@ def _train_one_epoch(model, loader, optimizer, criterion, device) -> float:
         log_probs = model(batch.x.float(), batch.edge_index, batch.batch)
         loss = criterion(log_probs, batch.y.view(-1).long())
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), _GRAD_CLIP)
         optimizer.step()
         total_loss += float(loss.item())
         n_batches += 1
@@ -399,9 +361,8 @@ def train(
     max_samples: Optional[int] = None,
     cache_dir: Optional[str] = _DEFAULT_CACHE_DIR,
     use_class_weights: bool = True,
-    threshold_metric: str = "balanced_accuracy",
+    threshold_metric: str = "f1",
     threshold: Optional[float] = None,
-    seed: int = 42,
 ) -> Optional[str]:
     """Run the full CHEM GAT training + evaluation pipeline.
 
@@ -422,10 +383,7 @@ def train(
     use_class_weights : bool, optional
         Weight the loss by inverse class frequency of the TRAIN split.
     threshold_metric : str, optional
-        ``"balanced_accuracy"`` (default), ``"f1"`` or ``"accuracy"``: what the
-        validation-tuned threshold maximises.
-    seed : int, optional
-        Seed for Python / NumPy / PyTorch and the train/val split (default 42).
+        ``"f1"`` or ``"accuracy"``: what the validation-tuned threshold maximises.
     threshold : float, optional
         Use this fixed decision threshold (e.g. 0.35) instead of tuning one on
         the validation split.
@@ -438,66 +396,71 @@ def train(
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[CHEM][train] Using device: {device}")
+    import random
+    random.seed(_SEED)
+    torch.manual_seed(_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_SEED)
 
     # --- Weights & Biases (guarded so offline / missing wandb never crashes). -
     wandb = _init_wandb(wandb_project, epochs, batch_size)
 
-    _seed_everything(seed)
-
     # --- Samples (and optional deterministic subset for smoke tests). -------
-    # PROTOCOL: official TRAIN -> (train, val) split.  Official DEV is the
-    # held-out TEST and is never mixed into training or validation.  (An earlier
-    # version concatenated dev into the training pool, so any "test" score was
-    # measured on memes the GAT had already trained on.)
     print("[CHEM][train] Loading Hateful Memes samples ...")
-    train_samples = _load_samples("train", data_dir)
-    dev_samples = _load_samples("dev", data_dir)
-    print(f"[CHEM][train] Loaded train={len(train_samples)} dev={len(dev_samples)} raw samples.")
-    if not train_samples:
-        print("[CHEM][train] ERROR: no training samples available; aborting training.")
+    # Official dev is the held-out TEST set: never pooled into train/val, never
+    # used for selection or thresholds. Each split is cleaned on its own.
+    train_raw = _load_samples("train", data_dir)
+    dev_raw = _load_samples("dev", data_dir)
+    print(f"[CHEM][train] Loaded {len(train_raw)} train + {len(dev_raw)} dev raw samples.")
+    if not train_raw:
+        print("[CHEM][train] ERROR: no samples available; aborting training.")
         return None
-    if dev_samples and {s["id"] for s in train_samples} & {s["id"] for s in dev_samples}:
-        print("[CHEM][train] WARNING: train and dev share sample ids; check the dataset layout.")
-    train_samples = train_utils.subsample(train_samples, max_samples)
-    dev_samples = train_utils.subsample(dev_samples, max_samples)
+    samples, clean_stats = train_utils.prepare_samples(train_raw)
+    print(f"[CHEM][train] Cleaning (train): {clean_stats}")
+    if not samples:
+        print("[CHEM][train] ERROR: no valid samples after cleaning; aborting training.")
+        return None
+    samples = train_utils.subsample(samples, max_samples)
+    for _s, _g in zip(samples, train_utils.assign_groups(samples), strict=True):
+        _s["group"] = _g
+        _s["is_dev"] = False
+    dev_samples, dev_stats = train_utils.prepare_samples(dev_raw) if dev_raw else ([], {})
+    if dev_raw:
+        print(f"[CHEM][train] Cleaning (dev): {dev_stats}")
     if max_samples:
-        print(f"[CHEM][train] --max-samples: train={len(train_samples)} dev={len(dev_samples)}.")
+        print(f"[CHEM][train] --max-samples: using {len(samples)} train samples.")
+        dev_samples = train_utils.subsample(dev_samples, max(1, max_samples // 5))
+    for _s in dev_samples:
+        _s["group"] = -1  # unused: dev is never split
+        _s["is_dev"] = True
+    samples = samples + dev_samples
 
     # --- Graphs: from cache when the fingerprint matches, else build+save. ---
-    encoders: Dict[str, Any] = {}
+    key = train_utils.graph_cache_key(samples)
+    dataset = train_utils.load_graph_cache(cache_dir, key)
+    if dataset is not None:
+        print(f"[CHEM][train] Loaded {len(dataset)} cached graphs (key {key}); encoders not needed.")
+    else:
+        print("[CHEM][train] Loading text + image encoders (once) ...")
+        from encoders.text_encoder import TextEncoder
+        from encoders.image_encoder import ImageEncoder
 
-    def _graphs_for(samples: List[Dict[str, Any]], name: str) -> List[Any]:
-        key = train_utils.graph_cache_key(samples)
-        graphs = train_utils.load_graph_cache(cache_dir, key)
-        if graphs is not None:
-            print(f"[CHEM][train] {name}: loaded {len(graphs)} cached graphs (key {key}).")
-            return graphs
-        if not encoders:
-            print("[CHEM][train] Loading text + image encoders (once) ...")
-            from encoders.text_encoder import TextEncoder
-            from encoders.image_encoder import ImageEncoder
-
-            encoders["text"] = TextEncoder(device=str(device))
-            encoders["image"] = ImageEncoder(device=str(device))
-        graphs = _build_dataset(samples, encoders["text"], encoders["image"])
-        print(f"[CHEM][train] {name}: built {len(graphs)} graphs from {len(samples)} samples "
-              f"({len(samples) - len(graphs)} skipped).")
-        saved = train_utils.save_graph_cache(cache_dir, key, graphs) if graphs else None
+        text_encoder = TextEncoder(device=str(device))
+        image_encoder = ImageEncoder(device=str(device))
+        dataset = _build_dataset(samples, text_encoder, image_encoder)
+        print(f"[CHEM][train] Built {len(dataset)} content-composition graphs "
+              f"from {len(samples)} samples ({len(samples) - len(dataset)} skipped).")
+        saved = train_utils.save_graph_cache(cache_dir, key, dataset) if dataset else None
         if saved:
             print(f"[CHEM][train] Cached graphs -> {saved}")
-        return graphs
-
-    dataset = _graphs_for(train_samples, "train")
     if not dataset:
         print("[CHEM][train] ERROR: no graphs built; aborting training.")
         return None
-    dev_graphs = _graphs_for(dev_samples, "dev") if dev_samples else []
 
-    splits = _split_train_val(dataset, seed=seed)
-    splits["test"] = dev_graphs  # official dev = untouched held-out test
+    splits = _split_with_dev_holdout(dataset)
     print(
         f"[CHEM][train] Split -> train={len(splits['train'])} "
-        f"val={len(splits['val'])} dev(test)={len(splits['test'])}"
+        f"val={len(splits['val'])} test={len(splits['test'])}"
     )
 
     from torch_geometric.loader import DataLoader
@@ -519,27 +482,28 @@ def train(
     else:
         criterion = nn.NLLLoss()
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
     os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
 
-    # --- Training loop with early stopping on validation ROC-AUC. ----------
-    # Checkpoint selection uses validation ROC-AUC (threshold-free).  Selecting on
-    # F1 at a fixed 0.35 cut-off rewards "predict everything harmful" (F1 ~0.67
-    # on a balanced set) and was one cause of the collapsed checkpoints.
-    best_val_f1 = -1.0  # name kept for log/ckpt compatibility; holds best val AUC
+    # --- Training loop with early stopping on validation AUC. --------------
+    best_val_auc = -1.0
     epochs_without_improvement = 0
     print("[CHEM][train] Starting training ...")
     for epoch in range(1, epochs + 1):
         train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_eval = _evaluate(model, val_loader, device)
         val_metrics = val_eval["metrics"]
-        val_f1 = val_metrics.get("auc", 0.0)
-        if val_f1 != val_f1:  # NaN guard (single-class validation batch)
-            val_f1 = 0.0
+        val_f1 = val_metrics.get("f1", 0.0)
+        _auc = val_metrics.get("auc")
+        val_select = _auc if (_auc is not None and _auc == _auc) else val_f1
+        scheduler.step(val_select)
 
         print(
             f"[CHEM][train] epoch {epoch:3d}/{epochs} | "
             f"train_loss={train_loss:.4f} | val_loss={val_eval['loss']:.4f} | "
-            f"val_auc={val_f1:.4f} | val_f1={val_metrics.get('f1', 0.0):.4f} | "
+            f"val_auc={val_select:.4f} | val_f1={val_f1:.4f} | "
             f"val_acc={val_metrics.get('accuracy', 0.0):.4f}"
         )
 
@@ -554,15 +518,15 @@ def train(
         )
 
         # Checkpoint + early-stopping bookkeeping.
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_select > best_val_auc:
+            best_val_auc = val_select
             epochs_without_improvement = 0
             torch.save(
-                {"state_dict": model.state_dict(), "val_auc": best_val_f1, "val_f1": best_val_f1, "epoch": epoch},
+                {"state_dict": model.state_dict(), "val_auc": best_val_auc, "val_f1": val_f1, "epoch": epoch},
                 _BEST_CHECKPOINT_PATH,
             )
             print(
-                f"[CHEM][train] new best val_auc={best_val_f1:.4f}; "
+                f"[CHEM][train] new best val_auc={best_val_auc:.4f}; "
                 f"saved -> {_BEST_CHECKPOINT_PATH}"
             )
         else:
@@ -587,22 +551,18 @@ def train(
         how = f"tuned on val {threshold_metric}"
     else:
         how = "fixed by --threshold"
-    if not splits["test"]:
-        print("[CHEM][train] No dev split found; skipping held-out evaluation.")
-        _wandb_finish(wandb)
-        return _BEST_CHECKPOINT_PATH
-    test_eval = _evaluate(model, test_loader, device)  # official DEV, evaluated once
+    test_eval = _evaluate(model, test_loader, device)
     test_metrics = test_eval["metrics"]  # at the fixed 0.5 threshold
     tuned = train_utils.metrics_at_threshold(test_eval["y_true"], test_eval["y_prob"], threshold)
     base_rate = sum(test_eval["y_true"]) / max(len(test_eval["y_true"]), 1)
 
-    print("[CHEM][train] ===== DEV (held-out) METRICS (threshold 0.50) =====")
+    print("[CHEM][train] ===== TEST METRICS (threshold 0.50) =====")
     print(f"[CHEM][train] accuracy : {test_metrics.get('accuracy', 0.0):.4f}")
     print(f"[CHEM][train] precision: {test_metrics.get('precision', 0.0):.4f}")
     print(f"[CHEM][train] recall   : {test_metrics.get('recall', 0.0):.4f}")
     print(f"[CHEM][train] f1       : {test_metrics.get('f1', 0.0):.4f}")
     print(f"[CHEM][train] auc      : {test_metrics.get('auc', 0.0):.4f}")
-    print(f"[CHEM][train] ===== DEV (held-out) METRICS (threshold {threshold:.2f}, {how}) =====")
+    print(f"[CHEM][train] ===== TEST METRICS (threshold {threshold:.2f}, {how}) =====")
     print(f"[CHEM][train] accuracy : {tuned['accuracy']:.4f}")
     print(f"[CHEM][train] precision: {tuned['precision']:.4f}")
     print(f"[CHEM][train] recall   : {tuned['recall']:.4f}")
@@ -744,10 +704,8 @@ def main() -> None:
                         help="Disable the graph cache (always rebuild).")
     parser.add_argument("--no-class-weights", dest="no_class_weights", action="store_true",
                         help="Use the plain unweighted loss.")
-    parser.add_argument("--threshold-metric", dest="threshold_metric",
-                        choices=("balanced_accuracy", "f1", "accuracy"), default="balanced_accuracy",
-                        help="What the validation-tuned threshold maximises.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed for torch/numpy/python + split.")
+    parser.add_argument("--threshold-metric", dest="threshold_metric", choices=("f1", "accuracy"),
+                        default="f1", help="What the validation-tuned threshold maximises.")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Fixed decision threshold (e.g. 0.35). Default: tune on validation.")
     args = parser.parse_args()
@@ -764,7 +722,6 @@ def main() -> None:
         use_class_weights=not args.no_class_weights,
         threshold_metric=args.threshold_metric,
         threshold=args.threshold,
-        seed=args.seed,
     )
 
 

@@ -36,18 +36,18 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from utils.config import get_coefficient, load_policy_config
+from utils.text_context import contains_keyword
 
 
 def _is_exculpatory(text: Optional[str]) -> bool:
-    """Return True if text contains an exculpatory keyword."""
+    """Return True if text contains an exculpatory keyword (whole word)."""
     if not text:
         return False
 
     cfg = load_policy_config()
     keywords = cfg.get("exculpatory_keywords", {}).get("keywords", [])
 
-    lower = text.lower()
-    return any(kw.lower() in lower for kw in keywords)
+    return contains_keyword(text, keywords)
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +63,9 @@ class CHEMPipeline:
 
         self.text_encoder = None
         self.image_encoder = None
+        self.ocr_encoder = None
         self.audio_encoder = None
+        self.audio_error: Optional[str] = None
         self.video_encoder = None
 
         self.graph_builder = None
@@ -141,6 +143,23 @@ class CHEMPipeline:
             self.image_encoder = ImageEncoder()
 
             # ---------------------------------------------------------- #
+            # OCR (text embedded inside images)
+            # ---------------------------------------------------------- #
+
+            try:
+                from encoders.ocr_encoder import OCREncoder
+
+                print("[CHEM][api] Loading OCR encoder...")
+                self.ocr_encoder = OCREncoder()
+
+            except Exception as exc:
+                self.ocr_encoder = None
+
+                print(
+                    f"[CHEM][api] OCR encoder unavailable: {exc}"
+                )
+
+            # ---------------------------------------------------------- #
             # Audio
             # ---------------------------------------------------------- #
 
@@ -149,13 +168,19 @@ class CHEMPipeline:
 
                 print("[CHEM][api] Loading audio encoder...")
                 self.audio_encoder = AudioEncoder(
-                    text_encoder=self.text_encoder
+                    text_encoder=self.text_encoder,
+                    whisper_model=os.environ.get(
+                        "CHEM_WHISPER_MODEL", "base"
+                    ),
                 )
 
                 print("[CHEM][api] Audio encoder ready.")
 
             except Exception as exc:
                 self.audio_encoder = None
+                # Keep the reason so /health and the UI can show it instead
+                # of only a console line that is easy to miss.
+                self.audio_error = f"{type(exc).__name__}: {exc}"
 
                 print(
                     f"[CHEM][api] Audio encoder unavailable: {exc}"
@@ -321,6 +346,13 @@ class CHEMPipeline:
         modality_scores: Dict[str, float] = {}
         pil_for_fusion = None
 
+        # Non-fatal problems surfaced to the UI (OCR missing, audio could
+        # not be transcribed, ...) so a degraded run is never silent.
+        warnings: List[str] = []
+        ocr_text = ""
+        ocr_score = 0.0
+        transcript = ""
+
         # ==============================================================
         # TEXT
         # ==============================================================
@@ -331,6 +363,13 @@ class CHEMPipeline:
             res = self.text_encoder.encode(text)
 
             text_elements = res.get("elements", [])
+
+            # The encoder's base node only labels itself "text" and keeps a
+            # truncated copy of the sentence; attach the full sentence so the
+            # scorer's phrase patterns can actually see what was written.
+            for _el in text_elements:
+                if _el.get("label") == "text":
+                    _el["text"] = text
 
             elements.extend(
                 _reindex(
@@ -375,6 +414,63 @@ class CHEMPipeline:
                 res.get("harm_score", 0.0)
             )
 
+            # ----------------------------------------------------------
+            # OCR: read text embedded in the image (captions, memes,
+            # screenshots) and score it like typed text.
+            # ----------------------------------------------------------
+
+            if self.ocr_encoder is None:
+                warnings.append(
+                    "OCR is not installed, so text inside the image was "
+                    "not read. Run: pip install easyocr"
+                )
+
+            else:
+                ocr = self.ocr_encoder.extract(pil)
+
+                if ocr.get("error"):
+                    warnings.append(
+                        f"OCR failed: {ocr['error']}"
+                    )
+
+                ocr_text = ocr.get("text", "") or ""
+
+                if ocr_text:
+                    print(
+                        "[CHEM][api] OCR text: "
+                        f"{ocr_text[:120]!r}"
+                    )
+
+                    ocr_res = self.text_encoder.encode(ocr_text)
+
+                    ocr_elements = ocr_res.get("elements", [])
+
+                    for _el in ocr_elements:
+                        _el["source"] = "ocr"
+
+                        if _el.get("label") == "text":
+                            _el["text"] = ocr_text
+
+                    elements.extend(
+                        _reindex(
+                            ocr_elements,
+                            "text",
+                            len(elements),
+                        )
+                    )
+
+                    ocr_score = float(
+                        ocr_res.get("harm_score", 0.0)
+                    )
+
+                    # Embedded text is text: it competes with typed text
+                    # for the text-modality score instead of adding a
+                    # fifth modality the scorer does not know about.
+                    modality_scores["text"] = max(
+                        modality_scores.get("text", 0.0),
+                        ocr_score,
+                    )
+
         # ==============================================================
         # AUDIO
         # ==============================================================
@@ -384,12 +480,18 @@ class CHEMPipeline:
             if self.audio_encoder is None:
                 raise ValueError(
                     "Audio analysis is unavailable because "
-                    "the audio encoder failed to load."
+                    "the audio encoder failed to load: "
+                    f"{self.audio_error or 'unknown error'}"
                 )
 
             print("[CHEM][api] Encoding audio...")
 
             res = self.audio_encoder.encode(audio_path)
+
+            transcript = res.get("transcript", "") or ""
+
+            for _msg in res.get("warnings", []) or []:
+                warnings.append(f"Audio: {_msg}")
 
             audio_elements = res.get("elements", [])
 
@@ -456,6 +558,10 @@ class CHEMPipeline:
                 "harmful_modalities": [],
                 "shap_scores": [],
                 "modality_scores": {},
+                "ocr_text": ocr_text,
+                "ocr_score": 0.0,
+                "transcript": transcript,
+                "warnings": warnings,
             }
 
         # ==============================================================
@@ -721,6 +827,22 @@ class CHEMPipeline:
                 )
                 for key, value in modality_scores.items()
             },
+
+            # Text read out of the image by OCR, and its own toxicity score
+            # (already folded into modality_scores["text"]).
+            "ocr_text": ocr_text,
+
+            "ocr_score": round(
+                float(ocr_score),
+                4,
+            ),
+
+            # Speech-to-text output for an uploaded audio clip.
+            "transcript": transcript,
+
+            # Anything that degraded the run (OCR missing, transcription
+            # failed, ...), so it is visible in the UI.
+            "warnings": warnings,
         }
 
 
@@ -803,7 +925,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
 
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",") if o.strip()],
 
     allow_credentials=True,
 
@@ -887,6 +1009,24 @@ def health() -> Dict[str, Any]:
             pipeline.audio_encoder is not None
             if pipeline.loaded
             else False
+        ),
+
+        "audio_error": (
+            pipeline.audio_error
+            if pipeline.loaded
+            else None
+        ),
+
+        "ocr_available": (
+            bool(getattr(pipeline.ocr_encoder, "available", False))
+            if pipeline.loaded
+            else False
+        ),
+
+        "ocr_error": (
+            getattr(pipeline.ocr_encoder, "load_error", None)
+            if pipeline.loaded
+            else None
         ),
 
         "video_available": (

@@ -29,6 +29,10 @@ class PrototypeHarmScorer:
             get_coefficient("cross_modal_min_image_score")
         )
 
+        # Toxic-BERT score from which text counts as strong evidence on its
+        # own (same cut-off already used for ``harmful_modalities``).
+        self.strong_text_score = 0.75
+
         self.min_audio_score = float(
             get_coefficient("cross_modal_min_audio_score")
         )
@@ -95,17 +99,317 @@ class PrototypeHarmScorer:
     def _text_pattern_evidence(
         self,
         graph: Dict[str, Any],
+        modalities: tuple = ("text",),
     ) -> Dict[str, Any]:
-        """Neutral by design.
 
-        This used to hold ~300 lines of hand-written regexes that were written
-        from individual Hateful Memes dev examples (e.g. the "white privilege
-        discount" and "knowing white people ... baby father" captions), which
-        contaminates any dev evaluation. It also never saw the real caption (the
-        node ``text`` field was never populated). Caption-level hate detection is
-        now done by the learned fusion model (model/hm_fusion.py), not rules.
-        """
-        return {"score": 0.0, "categories": [], "patterns": []}
+        texts = []
+
+        for node in self._get_nodes(graph):
+
+            if node.get("modality") not in modalities:
+                continue
+
+            # Base text node: full sentence in ``text`` (set by the API),
+            # else the encoder's ``full_label`` preview.  Category nodes
+            # carry no sentence, so their labels must not be mixed in.
+            # Audio nodes carry the spoken transcript in ``text``.
+            value = node.get("text")
+
+            if not value and node.get("label") == "text":
+                value = node.get("full_label")
+
+            if value and str(value) not in texts:
+                texts.append(str(value))
+
+        if not texts:
+
+            return {
+                "score": 0.0,
+                "categories": [],
+                "patterns": [],
+            }
+
+        text = " ".join(texts).lower()
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        ).strip()
+
+        score = 0.0
+        categories = []
+        patterns = []
+
+        def add(
+            amount: float,
+            category: str,
+            pattern: str,
+        ):
+
+            nonlocal score
+
+            score = max(
+                score,
+                amount,
+            )
+
+            if category not in categories:
+                categories.append(category)
+
+            if pattern not in patterns:
+                patterns.append(pattern)
+
+        # --------------------------------------------------------
+        # RACIAL / ETHNIC STEREOTYPES
+        # --------------------------------------------------------
+
+        racial_patterns = [
+
+            r"\bknowing\s+(white|black|asian|mexican|indian|jewish)\s+people\b",
+
+            r"\b(white|black|asian|mexican|indian|jewish)\s+privilege\b",
+
+            r"\b(white|black|asian|mexican|indian|jewish)\s+people\b"
+            r".*\b(probably|always|never|every|all)\b",
+
+            r"\b(white|black|asian|mexican|indian|jewish)\s+people\b"
+            r".*\bvs\b",
+
+            r"\b(white|black|asian|mexican|indian|jewish)\s+people\b"
+            r".*\b(father|mother|baby|women|men|criminal|lazy|stupid)\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in racial_patterns
+        ):
+
+            add(
+                0.86,
+                "hate_speech",
+                "RACIAL_OR_ETHNIC_STEREOTYPE",
+            )
+
+        # --------------------------------------------------------
+        # IDENTITY-TARGETED LANGUAGE
+        # --------------------------------------------------------
+
+        identity_patterns = [
+
+            r"\btranny\b",
+            r"\bretard(ed)?\b",
+            r"\bfag(got)?\b",
+            r"\bdyke\b",
+            r"\bspic\b",
+            r"\bchink\b",
+            r"\bkike\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in identity_patterns
+        ):
+
+            add(
+                0.90,
+                "hate_speech",
+                "IDENTITY_TARGETED_LANGUAGE",
+            )
+
+        # --------------------------------------------------------
+        # GENDER / SEXIST STEREOTYPES
+        # --------------------------------------------------------
+
+        gender_patterns = [
+
+            r"\bget back in the kitchen\b",
+
+            r"\bwomen belong in the kitchen\b",
+
+            r"\bwomen should\b.*\bkitchen\b",
+
+            r"\bgirls\b.*\bkitchen\b",
+
+            r"\bwomen\b.*\bbelong\b",
+
+            r"\bgirls\b.*\bshould\b.*\bhome\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in gender_patterns
+        ):
+
+            add(
+                0.82,
+                "hate_speech",
+                "GENDER_STEREOTYPE",
+            )
+
+        # --------------------------------------------------------
+        # EXPLICIT SEXUAL HARASSMENT
+        # --------------------------------------------------------
+
+        sexual_patterns = [
+
+            r"\bcumming in your mouth\b",
+
+            r"\bmolest\b",
+
+            r"\bmolesting\b",
+
+            r"\brape\b",
+
+            r"\bsexual harassment\b",
+
+            r"\bsexually exploit\b",
+
+            r"\bsuck me\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in sexual_patterns
+        ):
+
+            add(
+                0.88,
+                "sexual_exploitation",
+                "SEXUAL_HARASSMENT_OR_EXPLOITATION",
+            )
+
+        # --------------------------------------------------------
+        # EXTREMISM / TERRORISM
+        # --------------------------------------------------------
+
+        extremist_patterns = [
+
+            r"\bface of terrorism\b",
+
+            r"\bterroris(t|m)\b",
+
+            r"\bradicali[sz]ation\b",
+
+            r"\bextremis(t|m)\b",
+
+            r"\bextremist propaganda\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in extremist_patterns
+        ):
+
+            add(
+                0.78,
+                "extremist_content",
+                "EXTREMISM_OR_TERRORISM_REFERENCE",
+            )
+
+        # --------------------------------------------------------
+        # WEAPONS + DANGEROUS INTENT
+        # --------------------------------------------------------
+
+        weapon_patterns = [
+
+            r"\blandmines?\b",
+
+            r"\bgun\b.*\b(kill|shoot|attack|threat)\b",
+
+            r"\b(kill|shoot|attack|threat)\b.*\bgun\b",
+
+            r"\brifle\b.*\b(kill|shoot|attack)\b",
+
+            r"\bpistol\b.*\b(kill|shoot|attack)\b",
+
+            r"\bbomb\b.*\b(kill|attack|destroy)\b",
+
+            r"\bweapon\b.*\b(kill|attack|threat)\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in weapon_patterns
+        ):
+
+            add(
+                0.82,
+                "weapons_threat",
+                "DANGEROUS_WEAPON_CONTEXT",
+            )
+
+        # --------------------------------------------------------
+        # EXPLICIT THREAT
+        # --------------------------------------------------------
+
+        threat_patterns = [
+
+            r"\bi will kill you\b",
+
+            r"\bi'll kill you\b",
+
+            r"\bi am going to kill you\b",
+
+            r"\bi'm going to kill you\b",
+
+            r"\bi will hurt you\b",
+
+            r"\bi'll hurt you\b",
+
+            r"\bi am going to hurt you\b",
+
+            r"\bi'm going to hurt you\b",
+
+            r"\bkill\s+(him|her|them)\b",
+
+            r"\bshoot\s+(him|her|them)\b",
+
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+            )
+            for pattern in threat_patterns
+        ):
+
+            add(
+                0.90,
+                "violent_threat",
+                "EXPLICIT_THREAT",
+            )
+
+        return {
+            "score": self._safe_score(score),
+            "categories": categories,
+            "patterns": patterns,
+        }
 
     # ============================================================
     # PRIMARY CATEGORY
@@ -226,7 +530,7 @@ class PrototypeHarmScorer:
         harmful_pattern_edges = [
             edge
             for edge in edges
-            if edge.get("edge_type_name")
+            if edge.get("edge_type")
             == "harmful_pattern"
         ]
 
@@ -249,6 +553,78 @@ class PrototypeHarmScorer:
     # ============================================================
     # MAIN SCORER
     # ============================================================
+
+    def _build_explanation(
+        self,
+        verdict: str,
+        final_score: float,
+        normalized: Dict[str, float],
+        harmful_nodes: List[Dict[str, Any]],
+        text_evidence: Dict[str, Any],
+        policy_clause: Optional[Dict[str, Any]],
+        harmful_modalities: List[str],
+        harmful_pattern_edges: List[Dict[str, Any]],
+        cross_modal_flag: bool,
+    ) -> str:
+        """Evidence-based rationale that always agrees with the verdict."""
+
+        parts = [
+            f"{verdict}: risk score {final_score * 100:.0f}/100 "
+            f"(flag threshold {self.threshold * 100:.0f})."
+        ]
+
+        if normalized:
+            parts.append(
+                "Modality scores: "
+                + ", ".join(
+                    f"{m} {v * 100:.0f}"
+                    for m, v in normalized.items()
+                )
+                + "."
+            )
+
+        signals = []
+        for node in harmful_nodes:
+            name = node.get("full_label") or node.get("label")
+            conf = node.get("confidence")
+            if name and isinstance(conf, (int, float)):
+                signals.append(
+                    f"{name} ({node.get('modality', '?')}, "
+                    f"{conf * 100:.0f}%)"
+                )
+        if signals:
+            parts.append("Signals above the harmful cut-off: " + "; ".join(signals) + ".")
+
+        if text_evidence["patterns"]:
+            parts.append(
+                "Matched explicit phrase pattern(s) in the text: "
+                + ", ".join(text_evidence["categories"] or ["pattern"])
+                + "."
+            )
+
+        if isinstance(policy_clause, dict) and policy_clause.get("title"):
+            parts.append(
+                f"Closest policy: {policy_clause.get('clause_id', '')} "
+                f"{policy_clause['title']}.".replace("  ", " ")
+            )
+
+        if harmful_pattern_edges:
+            parts.append(
+                "The graph links two harmful elements, which adds a small "
+                "composition bonus."
+            )
+
+        if cross_modal_flag:
+            parts.append(
+                "More than one modality carries a meaningful signal ("
+                + ", ".join(harmful_modalities)
+                + ")."
+            )
+
+        if verdict == "SAFE" and not signals and not text_evidence["patterns"]:
+            parts.append("No harmful signal passed its cut-off.")
+
+        return " ".join(parts)
 
     def score(
         self,
@@ -296,6 +672,41 @@ class PrototypeHarmScorer:
             0.0,
         )
 
+        # Spoken words get the same explicit phrase checks as typed text,
+        # applied to the transcript carried on the audio nodes.  The result
+        # raises the audio score (it never lowers it) and is merged into the
+        # evidence used for the policy category / pattern list / explanation,
+        # while ``explicit_text`` below stays typed-or-OCR text only.
+        audio_evidence = (
+            self._text_pattern_evidence(
+                graph,
+                modalities=("audio",),
+            )
+        )
+
+        if audio_evidence["score"] > audio_score:
+
+            audio_score = audio_evidence["score"]
+            normalized["audio"] = audio_score
+
+        if audio_evidence["patterns"]:
+
+            text_evidence = {
+                "score": text_evidence["score"],
+                "categories": list(
+                    dict.fromkeys(
+                        text_evidence["categories"]
+                        + audio_evidence["categories"]
+                    )
+                ),
+                "patterns": list(
+                    dict.fromkeys(
+                        text_evidence["patterns"]
+                        + audio_evidence["patterns"]
+                    )
+                ),
+            }
+
         video_score = normalized.get(
             "video",
             0.0,
@@ -319,6 +730,12 @@ class PrototypeHarmScorer:
         if explicit_text >= 0.55:
 
             text_evidence_score = explicit_text
+
+        elif text_score >= self.strong_text_score:
+
+            # Unmistakable toxicity (e.g. a direct threat) must not be
+            # discounted just because no hand-written phrase matched.
+            text_evidence_score = text_score * 0.80
 
         else:
 
@@ -455,7 +872,7 @@ class PrototypeHarmScorer:
         harmful_pattern_edges = [
             edge
             for edge in edges
-            if edge.get("edge_type_name")
+            if edge.get("edge_type")
             == "harmful_pattern"
         ]
 
@@ -539,60 +956,16 @@ class PrototypeHarmScorer:
             )
         )
 
-        explanation_parts = []
-
-        if text_evidence["patterns"]:
-
-            explanation_parts.append(
-                "Contextual text-pattern "
-                "evidence detected."
-            )
-
-        if harmful_modalities:
-
-            explanation_parts.append(
-                "Meaningful harmful evidence "
-                "detected in: "
-                + ", ".join(
-                    harmful_modalities
-                )
-            )
-
-        if (
-            image_score > 0
-            and image_score < 0.65
-        ):
-
-            explanation_parts.append(
-                "Visual evidence was treated "
-                "as supporting rather than "
-                "decisive evidence."
-            )
-
-        if harmful_pattern_edges:
-
-            explanation_parts.append(
-                "The content composition graph "
-                "contains a harmful-pattern "
-                "relationship."
-            )
-
-        if cross_modal_flag:
-
-            explanation_parts.append(
-                "Multiple meaningful modalities "
-                "reinforce the signal."
-            )
-
-        if not explanation_parts:
-
-            explanation_parts.append(
-                "No strong deterministic "
-                "harmful pattern was detected."
-            )
-
-        explanation = " ".join(
-            explanation_parts
+        explanation = self._build_explanation(
+            verdict=verdict,
+            final_score=final_score,
+            normalized=normalized,
+            harmful_nodes=harmful_nodes,
+            text_evidence=text_evidence,
+            policy_clause=policy_clause,
+            harmful_modalities=harmful_modalities,
+            harmful_pattern_edges=harmful_pattern_edges,
+            cross_modal_flag=cross_modal_flag,
         )
 
         return {
