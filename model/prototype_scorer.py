@@ -29,6 +29,10 @@ class PrototypeHarmScorer:
             get_coefficient("cross_modal_min_image_score")
         )
 
+        # Toxic-BERT score from which text counts as strong evidence on its
+        # own (same cut-off already used for ``harmful_modalities``).
+        self.strong_text_score = 0.75
+
         self.min_audio_score = float(
             get_coefficient("cross_modal_min_audio_score")
         )
@@ -104,10 +108,13 @@ class PrototypeHarmScorer:
             if node.get("modality") != "text":
                 continue
 
-            value = (
-                node.get("text")
-                or node.get("label")
-            )
+            # Base text node: full sentence in ``text`` (set by the API),
+            # else the encoder's ``full_label`` preview.  Category nodes
+            # carry no sentence, so their labels must not be mixed in.
+            value = node.get("text")
+
+            if not value and node.get("label") == "text":
+                value = node.get("full_label")
 
             if value:
                 texts.append(str(value))
@@ -545,6 +552,78 @@ class PrototypeHarmScorer:
     # MAIN SCORER
     # ============================================================
 
+    def _build_explanation(
+        self,
+        verdict: str,
+        final_score: float,
+        normalized: Dict[str, float],
+        harmful_nodes: List[Dict[str, Any]],
+        text_evidence: Dict[str, Any],
+        policy_clause: Optional[Dict[str, Any]],
+        harmful_modalities: List[str],
+        harmful_pattern_edges: List[Dict[str, Any]],
+        cross_modal_flag: bool,
+    ) -> str:
+        """Evidence-based rationale that always agrees with the verdict."""
+
+        parts = [
+            f"{verdict}: risk score {final_score * 100:.0f}/100 "
+            f"(flag threshold {self.threshold * 100:.0f})."
+        ]
+
+        if normalized:
+            parts.append(
+                "Modality scores: "
+                + ", ".join(
+                    f"{m} {v * 100:.0f}"
+                    for m, v in normalized.items()
+                )
+                + "."
+            )
+
+        signals = []
+        for node in harmful_nodes:
+            name = node.get("full_label") or node.get("label")
+            conf = node.get("confidence")
+            if name and isinstance(conf, (int, float)):
+                signals.append(
+                    f"{name} ({node.get('modality', '?')}, "
+                    f"{conf * 100:.0f}%)"
+                )
+        if signals:
+            parts.append("Signals above the harmful cut-off: " + "; ".join(signals) + ".")
+
+        if text_evidence["patterns"]:
+            parts.append(
+                "Matched explicit phrase pattern(s) in the text: "
+                + ", ".join(text_evidence["categories"] or ["pattern"])
+                + "."
+            )
+
+        if isinstance(policy_clause, dict) and policy_clause.get("title"):
+            parts.append(
+                f"Closest policy: {policy_clause.get('clause_id', '')} "
+                f"{policy_clause['title']}.".replace("  ", " ")
+            )
+
+        if harmful_pattern_edges:
+            parts.append(
+                "The graph links two harmful elements, which adds a small "
+                "composition bonus."
+            )
+
+        if cross_modal_flag:
+            parts.append(
+                "More than one modality carries a meaningful signal ("
+                + ", ".join(harmful_modalities)
+                + ")."
+            )
+
+        if verdict == "SAFE" and not signals and not text_evidence["patterns"]:
+            parts.append("No harmful signal passed its cut-off.")
+
+        return " ".join(parts)
+
     def score(
         self,
         graph: Dict[str, Any],
@@ -614,6 +693,12 @@ class PrototypeHarmScorer:
         if explicit_text >= 0.55:
 
             text_evidence_score = explicit_text
+
+        elif text_score >= self.strong_text_score:
+
+            # Unmistakable toxicity (e.g. a direct threat) must not be
+            # discounted just because no hand-written phrase matched.
+            text_evidence_score = text_score * 0.80
 
         else:
 
@@ -834,60 +919,16 @@ class PrototypeHarmScorer:
             )
         )
 
-        explanation_parts = []
-
-        if text_evidence["patterns"]:
-
-            explanation_parts.append(
-                "Contextual text-pattern "
-                "evidence detected."
-            )
-
-        if harmful_modalities:
-
-            explanation_parts.append(
-                "Meaningful harmful evidence "
-                "detected in: "
-                + ", ".join(
-                    harmful_modalities
-                )
-            )
-
-        if (
-            image_score > 0
-            and image_score < 0.65
-        ):
-
-            explanation_parts.append(
-                "Visual evidence was treated "
-                "as supporting rather than "
-                "decisive evidence."
-            )
-
-        if harmful_pattern_edges:
-
-            explanation_parts.append(
-                "The content composition graph "
-                "contains a harmful-pattern "
-                "relationship."
-            )
-
-        if cross_modal_flag:
-
-            explanation_parts.append(
-                "Multiple meaningful modalities "
-                "reinforce the signal."
-            )
-
-        if not explanation_parts:
-
-            explanation_parts.append(
-                "No strong deterministic "
-                "harmful pattern was detected."
-            )
-
-        explanation = " ".join(
-            explanation_parts
+        explanation = self._build_explanation(
+            verdict=verdict,
+            final_score=final_score,
+            normalized=normalized,
+            harmful_nodes=harmful_nodes,
+            text_evidence=text_evidence,
+            policy_clause=policy_clause,
+            harmful_modalities=harmful_modalities,
+            harmful_pattern_edges=harmful_pattern_edges,
+            cross_modal_flag=cross_modal_flag,
         )
 
         return {

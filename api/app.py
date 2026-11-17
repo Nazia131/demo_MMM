@@ -280,6 +280,13 @@ class CHEMPipeline:
 
             text_elements = res.get("elements", [])
 
+            # The encoder's base node only labels itself "text" and keeps a
+            # truncated copy of the sentence; attach the full sentence so the
+            # scorer's phrase patterns can actually see what was written.
+            for _el in text_elements:
+                if _el.get("label") == "text":
+                    _el["text"] = text
+
             elements.extend(
                 _reindex(
                     text_elements,
