@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from evaluate.metrics import compute_metrics, pretty_print
-from utils.config import get_harm_categories
+from utils.config import get_coefficient, get_harm_categories
 
 
 # ---------------------------------------------------------------------------

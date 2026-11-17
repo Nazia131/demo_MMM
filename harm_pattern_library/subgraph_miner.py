@@ -187,7 +187,7 @@ class SubgraphMiner:
         n_safe = len(norm_safe)
         kept: List[Dict[str, Any]] = []
 
-        for cidx, (key, info) in enumerate(candidates.items()):
+        for cidx, (_key, info) in enumerate(candidates.items()):
             template = info["template"]
 
             harmful_hits = sum(

@@ -56,7 +56,7 @@ GAT_IN_CHANNELS: int = 768       # node feature width (== embedding_dim)
 GAT_HIDDEN_CHANNELS: int = 256   # per-head output width of layer 1
 GAT_HEADS: int = 8               # attention heads in layer 1
 GAT_NUM_CLASSES: int = 2         # SAFE (0) / HARMFUL (1)
-GAT_DROPOUT: float = 0.6         # dropout applied inside both GATConv layers
+GAT_DROPOUT: float = 0.3         # dropout applied inside both GATConv layers
 
 
 def _embedding_dim_from_config() -> Optional[int]:
