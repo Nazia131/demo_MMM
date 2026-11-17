@@ -28,7 +28,7 @@ _GRAPH_SHAPING_FILES = (
 )
 
 # Bump when the graphs' stored attributes change (e.g. new ``group_id`` field).
-_CACHE_VERSION = "2"
+_CACHE_VERSION = "3"
 
 
 # ------------------------------------------------------------------ weights
@@ -74,12 +74,23 @@ def best_threshold(
     Meant to be called on VALIDATION predictions only; ties keep the threshold
     closest to 0.5 so the result is stable.
     """
-    if metric not in ("f1", "accuracy"):
-        raise ValueError("metric must be 'f1' or 'accuracy'")
+    if metric not in ("f1", "accuracy", "balanced_accuracy"):
+        raise ValueError("metric must be 'f1', 'accuracy' or 'balanced_accuracy'")
+    import numpy as np
+
+    y_arr = np.asarray(list(y_true), dtype=int)
     best_t, best_v = 0.5, -1.0
     for i in range(5, 96):
         t = i / 100.0
-        v = metrics_at_threshold(y_true, y_prob, t)[metric]
+        if metric == "balanced_accuracy":
+            # Mean of SAFE recall and HARMFUL recall: cannot be gamed by predicting
+            # one class and does not depend on the split's class prior.
+            pred = (np.asarray(list(y_prob), dtype=float) >= t).astype(int)
+            rec_pos = float(((pred == 1) & (y_arr == 1)).sum()) / max(int((y_arr == 1).sum()), 1)
+            rec_neg = float(((pred == 0) & (y_arr == 0)).sum()) / max(int((y_arr == 0).sum()), 1)
+            v = 0.5 * (rec_pos + rec_neg)
+        else:
+            v = metrics_at_threshold(y_true, y_prob, t)[metric]
         if v > best_v + 1e-12 or (abs(v - best_v) <= 1e-12 and abs(t - 0.5) < abs(best_t - 0.5)):
             best_t, best_v = t, v
     return best_t

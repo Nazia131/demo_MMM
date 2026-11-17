@@ -138,13 +138,18 @@ def load_hateful_memes(data_dir: str, split: str = "train") -> Iterator[dict[str
             rel_img = record.get("img", "")
             abs_img = os.path.join(abs_root, rel_img) if rel_img else ""
 
-            yield {
+            sample = {
                 "id": str(record.get("id", line_no)),
                 "img": abs_img,
                 "text": record.get("text", ""),
                 # Blind test splits omit 'label'; use -1 as an explicit sentinel.
                 "label": int(record["label"]) if "label" in record else -1,
             }
+            # Pass through native policy-category annotations when a dataset has
+            # them (Hateful Memes does not).  Never synthesised from model output.
+            if "category" in record:
+                sample["category"] = record["category"]
+            yield sample
             count += 1
 
     _log(f"Yielded {count} samples from '{split}' ({skipped} malformed lines skipped).")

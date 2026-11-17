@@ -176,6 +176,7 @@ def _build_dataset(
             graph_dict = build_graph(elements, label)
             data = graph_dict["data"]
             data.group_id = torch.tensor([int(sample.get("group", i))], dtype=torch.long)
+            data.is_dev = torch.tensor([1 if sample.get("is_dev") else 0], dtype=torch.long)
             dataset.append(data)
         except Exception as exc:  # pragma: no cover - never let one bad sample stop training
             print(f"[CHEM][train] skipping sample {sample.get('id', i)}: {exc}")
@@ -184,6 +185,20 @@ def _build_dataset(
             print(f"[CHEM][train] built graphs {i + 1}/{total}")
 
     return dataset
+
+
+def _split_with_dev_holdout(dataset: List[Any], seed: int = 42) -> Dict[str, List[Any]]:
+    """train/val (85/15, grouped, stratified) from TRAIN graphs only; the dev
+    graphs become ``test``. Falls back to the 70/15/15 split when there is no dev."""
+    is_dev = [bool(getattr(g, "is_dev", None) is not None and int(g.is_dev.view(-1)[0])) for g in dataset]
+    dev = [g for g, d in zip(dataset, is_dev) if d]
+    tr_all = [g for g, d in zip(dataset, is_dev) if not d]
+    if not dev:
+        return _split_dataset(tr_all, seed)
+    labels = [int(g.y.view(-1)[0]) for g in tr_all]
+    groups = [int(g.group_id.view(-1)[0]) for g in tr_all]
+    tr, va = train_utils.stratified_group_split(labels, groups, (0.85, 0.15), seed)
+    return {"train": [tr_all[i] for i in tr], "val": [tr_all[i] for i in va], "test": dev}
 
 
 def _split_dataset(dataset: List[Any], seed: int = 42) -> Dict[str, List[Any]]:
@@ -392,23 +407,33 @@ def train(
 
     # --- Samples (and optional deterministic subset for smoke tests). -------
     print("[CHEM][train] Loading Hateful Memes samples ...")
-    samples = _load_samples("train", data_dir)
-    # Some distributions ship a separate dev split; fold it in when present.
-    samples += _load_samples("dev", data_dir)
-    print(f"[CHEM][train] Loaded {len(samples)} raw samples.")
-    if not samples:
+    # Official dev is the held-out TEST set: never pooled into train/val, never
+    # used for selection or thresholds. Each split is cleaned on its own.
+    train_raw = _load_samples("train", data_dir)
+    dev_raw = _load_samples("dev", data_dir)
+    print(f"[CHEM][train] Loaded {len(train_raw)} train + {len(dev_raw)} dev raw samples.")
+    if not train_raw:
         print("[CHEM][train] ERROR: no samples available; aborting training.")
         return None
-    samples, clean_stats = train_utils.prepare_samples(samples)
-    print(f"[CHEM][train] Cleaning: {clean_stats}")
+    samples, clean_stats = train_utils.prepare_samples(train_raw)
+    print(f"[CHEM][train] Cleaning (train): {clean_stats}")
     if not samples:
         print("[CHEM][train] ERROR: no valid samples after cleaning; aborting training.")
         return None
     samples = train_utils.subsample(samples, max_samples)
     for _s, _g in zip(samples, train_utils.assign_groups(samples), strict=True):
         _s["group"] = _g
+        _s["is_dev"] = False
+    dev_samples, dev_stats = train_utils.prepare_samples(dev_raw) if dev_raw else ([], {})
+    if dev_raw:
+        print(f"[CHEM][train] Cleaning (dev): {dev_stats}")
     if max_samples:
-        print(f"[CHEM][train] --max-samples: using {len(samples)} samples.")
+        print(f"[CHEM][train] --max-samples: using {len(samples)} train samples.")
+        dev_samples = train_utils.subsample(dev_samples, max(1, max_samples // 5))
+    for _s in dev_samples:
+        _s["group"] = -1  # unused: dev is never split
+        _s["is_dev"] = True
+    samples = samples + dev_samples
 
     # --- Graphs: from cache when the fingerprint matches, else build+save. ---
     key = train_utils.graph_cache_key(samples)
@@ -432,7 +457,7 @@ def train(
         print("[CHEM][train] ERROR: no graphs built; aborting training.")
         return None
 
-    splits = _split_dataset(dataset)
+    splits = _split_with_dev_holdout(dataset)
     print(
         f"[CHEM][train] Split -> train={len(splits['train'])} "
         f"val={len(splits['val'])} test={len(splits['test'])}"

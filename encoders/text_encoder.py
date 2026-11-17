@@ -152,6 +152,25 @@ class TextEncoder:
         probs = torch.sigmoid(logits).detach().cpu().tolist()
         return {label: float(p) for label, p in zip(self._tox_labels, probs)}
 
+    # ------------------------------------------------------- learned-fusion API
+    @property
+    def tox_labels(self) -> List[str]:
+        """Ordered toxic-bert label names (the column order of ``analyze()['toxic']``)."""
+        return list(self._tox_labels)
+
+    def analyze(self, text: str) -> Dict[str, Any]:
+        """Return the raw features the learned fusion head consumes.
+
+        Unlike :meth:`encode` this does not build graph elements or apply any
+        policy threshold: it exposes the RoBERTa sentence embedding and the six
+        toxic-bert probabilities as plain features.
+
+        Inputs: a text string.
+        Outputs: ``{"embedding": list[float] (768), "toxic": {label: prob}}``.
+        """
+        text = text or ""
+        return {"embedding": self._embed(text), "toxic": self._toxic_scores(text)}
+
     # ------------------------------------------------------------------ encode
     def encode(self, text: str) -> Dict[str, Any]:
         """Encode ``text`` into CHEM elements plus a scalar harm score.

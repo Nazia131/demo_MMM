@@ -77,6 +77,9 @@ class CHEMPipeline:
 
         self._fuse = None
 
+        # Optional learned text+image fusion head (see model/hm_fusion.py).
+        self.fusion = None
+
     # ------------------------------------------------------------------ #
     # Loading
     # ------------------------------------------------------------------ #
@@ -219,6 +222,12 @@ class CHEMPipeline:
             self.harm_scorer = PrototypeHarmScorer()
 
             # ---------------------------------------------------------- #
+            # Optional learned fusion head
+            # ---------------------------------------------------------- #
+
+            self._load_fusion()
+
+            # ---------------------------------------------------------- #
             # Optional explainability
             # ---------------------------------------------------------- #
 
@@ -272,6 +281,48 @@ class CHEMPipeline:
 
             traceback.print_exc()
 
+    def _load_fusion(self) -> None:
+        """Load the trained fusion bundle if present; never raises.
+
+        Looks at ``$CHEM_FUSION_BUNDLE`` or ``model/checkpoints/hm_fusion/final.joblib``.
+        The bundle is used only if its recorded encoder metadata (toxic-bert label
+        order, CLIP concept list) matches the encoders loaded here; otherwise the
+        deterministic prototype stays active.  NOTE: bundles are joblib/pickle
+        files - only load ones you trained yourself.
+        """
+        self.fusion = None
+        try:
+            from model.hm_fusion import DEFAULT_OUT_DIR, FusionBundle
+            from model.hm_features import encoder_meta
+
+            path = os.environ.get(
+                "CHEM_FUSION_BUNDLE", os.path.join(DEFAULT_OUT_DIR, "final.joblib")
+            )
+            if not os.path.isfile(path):
+                print(
+                    "[CHEM][api] No fusion bundle found; using the deterministic "
+                    "prototype scorer."
+                )
+                return
+
+            bundle = FusionBundle.load(path)
+            live = encoder_meta(self.text_encoder, self.image_encoder)
+            for key in ("tox_labels", "concept_prompts", "harmful_mask", "feature_version", "clip_model"):
+                if bundle.meta.get(key) != live.get(key):
+                    print(
+                        f"[CHEM][api] Fusion bundle ignored: '{key}' does not match "
+                        "the loaded encoders (retrain with model.hm_fusion)."
+                    )
+                    return
+            self.fusion = bundle
+            print(
+                f"[CHEM][api] Learned fusion head loaded ('{bundle.feature_set}', "
+                f"threshold={bundle.threshold:.2f})."
+            )
+        except Exception as exc:
+            self.fusion = None
+            print(f"[CHEM][api] Fusion head unavailable ({exc}); using prototype.")
+
     # ------------------------------------------------------------------ #
     # Inference
     # ------------------------------------------------------------------ #
@@ -293,6 +344,7 @@ class CHEMPipeline:
 
         elements: List[Dict[str, Any]] = []
         modality_scores: Dict[str, float] = {}
+        pil_for_fusion = None
 
         # Non-fatal problems surfaced to the UI (OCR missing, audio could
         # not be transcribed, ...) so a degraded run is never silent.
@@ -343,6 +395,8 @@ class CHEMPipeline:
             pil = Image.open(
                 io.BytesIO(image_bytes)
             ).convert("RGB")
+
+            pil_for_fusion = pil
 
             res = self.image_encoder.encode(pil)
 
@@ -559,13 +613,49 @@ class CHEMPipeline:
         # FINAL DECISION
         # ==============================================================
 
-        final_score = float(
+        prototype_score = float(
             score.get("harm_score", 0.0)
         )
 
+        final_score = prototype_score
+
         threshold = float(
-    get_coefficient("final_harm_threshold")
-)
+            get_coefficient("final_harm_threshold")
+        )
+
+        inference_mode = "deterministic_prototype"
+
+        # Learned text+image fusion decides the verdict when a trained bundle is
+        # loaded AND both a caption and an image were supplied (it was trained on
+        # that pairing; audio/video or single-modality inputs stay on the
+        # prototype).  Policy patterns below remain auxiliary evidence only.
+        if (
+            self.fusion is not None
+            and text
+            and pil_for_fusion is not None
+            and audio_path is None
+            and video_path is None
+        ):
+            try:
+                from model.hm_features import extract_one
+
+                blocks = extract_one(
+                    text,
+                    pil_for_fusion,
+                    self.text_encoder,
+                    self.image_encoder,
+                    self.fusion.meta,
+                )
+                final_score = float(
+                    self.fusion.predict_proba(blocks)[0]
+                )
+                threshold = float(self.fusion.threshold)
+                inference_mode = "learned_fusion"
+            except Exception as exc:
+                print(
+                    "[CHEM][api] Fusion inference failed; "
+                    f"falling back to prototype: {exc}"
+                )
 
         verdict = (
             "HARMFUL"
@@ -599,6 +689,14 @@ class CHEMPipeline:
             "explanation",
             "",
         )
+
+        if inference_mode == "learned_fusion":
+            explanation = (
+                f"Verdict from the learned text+image fusion model "
+                f"(harmful probability {final_score:.2f}, decision threshold "
+                f"{threshold:.2f}). Pattern evidence is auxiliary: "
+                f"{explanation}"
+            )
 
         # The prototype scorer already produces a deterministic
         # explanation. Learned explainability is optional and should
@@ -700,6 +798,18 @@ class CHEMPipeline:
             ),
 
             "explanation": explanation,
+
+            "inference_mode": inference_mode,
+
+            "decision_threshold": round(
+                threshold,
+                4,
+            ),
+
+            "prototype_score": round(
+                prototype_score,
+                4,
+            ),
 
             "cross_modal_flag": bool(
                 score.get(
@@ -886,7 +996,11 @@ def health() -> Dict[str, Any]:
         "models_loaded": pipeline.loaded,
 
         "inference_mode": (
-            "deterministic_prototype"
+            (
+                "learned_fusion"
+                if pipeline.fusion is not None
+                else "deterministic_prototype"
+            )
             if pipeline.loaded
             else None
         ),

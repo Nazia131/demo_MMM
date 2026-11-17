@@ -296,9 +296,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model.load_state_dict(ckpt.get("state_dict", ckpt))
         model.eval()
 
-        samples = _load_samples("train", args.data_dir) + _load_samples(
-            "dev", args.data_dir
-        )
+        # TRAIN only: official dev must never be pooled into a random "test" split.
+        samples = _load_samples("train", args.data_dir)
         graphs = _build_dataset(
             samples, TextEncoder(device=str(device)), ImageEncoder(device=str(device))
         )
