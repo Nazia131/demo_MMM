@@ -262,10 +262,12 @@ Response (abridged):
 ## 6. Evaluation
 
 ```bash
-# Standard metrics on the held-out test set (accuracy / precision / recall / F1 / AUC + per-class)
+# GAT metrics on a held-out slice of TRAIN graphs (official dev is no longer pooled in)
 python3 -m evaluate.metrics --checkpoint model/checkpoints/best_gat.pt --data-dir data/hateful_memes
 
-# Zero-shot structural generalisation: hold out one entire harm category
+# Zero-shot (leave-one-category-out). Needs a dataset with NATIVE category labels;
+# on Hateful Memes (binary labels only) it now stops with an explanation instead of
+# scoring model-derived categories. See section 6b for the valid binary evaluation.
 python3 -m evaluate.zero_shot_eval --held-out-category weapons_threat --data-dir data/hateful_memes
 
 # Ablations: no-graph / no-policy-tags / no-temporal-edges / GCN-instead-of-GAT
@@ -273,6 +275,46 @@ python3 -m evaluate.ablation_study --data-dir data/hateful_memes
 ```
 
 ---
+
+## 6b. Hateful Memes benchmark (binary) - learned fusion + frozen evaluation
+
+Hateful Memes is a **binary, multimodal** task (hateful / not hateful). It has
+no CHEM policy-category labels, so the 10-category taxonomy is used only for
+explanations, never as ground truth. The benchmark classifier is a small
+learned fusion head over text + image features.
+
+**Protocol (no leakage)**
+
+| Split | Used for |
+|---|---|
+| official `train.jsonl` -> train (85 %) | fitting scaler + classifier |
+| official `train.jsonl` -> val (15 %, stratified, caption/image-grouped) | model selection + decision threshold |
+| official `dev.jsonl` | evaluated **once**, from frozen bundles (`evaluate/hm_eval.py`) |
+
+Scaler statistics, hyper-parameters, the final model and the threshold are all
+chosen without looking at dev. Memes that share a caption or an image are kept
+on the same side of the train/val split.
+
+**Features** (`model/hm_features.py`): RoBERTa caption embedding, toxic-bert
+scores, CLIP image embedding, CLIP policy-concept probabilities (a vector, not a
+thresholded score), CLIP caption embedding and an image x caption interaction
+block. Baselines A-D use subsets; `fusion` uses all.
+
+```powershell
+# 1) extract + cache features (CPU: roughly 30-60 min for train+dev; resumable)
+python -m model.hm_fusion extract --data-dir data/hateful_memes --splits train dev
+
+# 2) train baselines A-D + fusion on TRAIN only; threshold + model chosen on VAL
+python -m model.hm_fusion train --data-dir data/hateful_memes
+
+# 3) evaluate frozen bundles on the untouched dev split (+ error analysis files)
+python -m evaluate.hm_eval --data-dir data/hateful_memes --all
+```
+
+When `model/checkpoints/hm_fusion/final.joblib` exists, the API uses it for
+requests that contain **both** a caption and an image (`inference_mode =
+learned_fusion`); everything else, and any load failure, falls back to the
+deterministic prototype. Bundles are pickle files: only load ones you trained.
 
 ## Design guarantees (project constraints)
 

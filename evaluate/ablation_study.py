@@ -555,7 +555,8 @@ def _make_trainer(data_dir: str, epochs: int, batch_size: int) -> Callable:
     image_enc = ImageEncoder(device=str(device))
 
     print("[CHEM][ablation] Loading and encoding dataset (done once)...")
-    samples = _load_samples("train", data_dir) + _load_samples("dev", data_dir)
+    # TRAIN only: pooling official dev into the random split leaked dev memes into training.
+    samples = _load_samples("train", data_dir)
     full_dataset = _build_dataset(samples, text_enc, image_enc)
     splits = _split_dataset(full_dataset)
     print(f"[CHEM][ablation] Dataset ready: {len(full_dataset)} graphs.")

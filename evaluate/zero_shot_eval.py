@@ -10,13 +10,53 @@ The headline metric is zero-shot F1.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from evaluate.metrics import compute_metrics, pretty_print
-from utils.config import get_harm_categories
+# get_coefficient was previously used below without being imported; the resulting
+# NameError was swallowed by ``except Exception`` and silently forced threshold 0.5.
+from utils.config import get_coefficient, get_harm_categories
+
+_VALIDITY_NOTICE = """
+================================================================================
+ ZERO-SHOT (LEAVE-ONE-CATEGORY-OUT) EVALUATION IS NOT SCIENTIFICALLY VALID HERE
+================================================================================
+ Hateful Memes only has a binary label (0 = not hateful, 1 = hateful).  It has
+ NO ground-truth CHEM policy category (hate_speech, violent_threat, ...), so
+ "samples that belong to the held-out category" do not exist in the data.
+
+ The only way to assign a category is to ask CHEM's own encoders (toxic-bert /
+ CLIP concepts).  That is circular: the same model that is being evaluated would
+ be defining the evaluation subset, and the model was never trained to exclude
+ that category either (the GAT is trained on the binary label).
+
+ To run a genuine zero-shot study you need a dataset whose records carry a
+ native "category" field (human-annotated CHEM / policy categories).  The primary
+ Hateful Memes result is the binary evaluation:
+
+     python -m evaluate.hm_eval --data-dir data/hateful_memes
+================================================================================
+"""
+
+
+def _has_native_categories(data_dir: str, split: str = "dev") -> bool:
+    """True only if the dataset's own records carry a ``category`` field."""
+    try:
+        from data.preprocess.hateful_memes import _resolve_split_file
+
+        with open(_resolve_split_file(data_dir, split), "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    return "category" in json.loads(line)
+    except Exception:
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -492,9 +532,11 @@ def _run_with_checkpoint(
     """
     Evaluate an existing GAT checkpoint on a held-out category.
 
-    WARNING:
-    The category assignment depends on the encoder's policy_category output.
-    Hateful Memes itself does not provide CHEM categories.
+    WARNING - EXPLORATORY ONLY, NOT A VALID ZERO-SHOT RESULT:
+    The category assignment depends on the encoder's own policy_category output
+    (circular: the model defines its evaluation subset).  Hateful Memes itself
+    does not provide CHEM categories.  Reachable only via
+    ``--allow-model-derived-categories``.
     """
 
     import torch
@@ -567,10 +609,11 @@ def _run_with_checkpoint(
         "Loading test samples..."
     )
 
-    raw_samples = _load_samples(
-        "test",
-        data_dir,
-    )
+    # Use the labelled dev split.  The blind test split has no labels (the loader
+    # emits -1), which would silently corrupt every metric.
+    raw_samples = [
+        s for s in _load_samples("dev", data_dir) if int(s.get("label", -1)) >= 0
+    ]
 
     from graph.graph_builder import build_graph
 
@@ -835,7 +878,38 @@ def main() -> None:
         help="Decision threshold.",
     )
 
+    parser.add_argument(
+        "--allow-model-derived-categories",
+        action="store_true",
+        help=(
+            "Run the circular, exploratory checkpoint evaluation even though the "
+            "dataset has no native category labels. Results are NOT a valid "
+            "zero-shot measurement."
+        ),
+    )
+
     args = parser.parse_args()
+
+    # ---------------------------------------------------------------
+    # Scientific-validity gate
+    # ---------------------------------------------------------------
+
+    if not _has_native_categories(args.data_dir):
+        print(_VALIDITY_NOTICE)
+        if not args.allow_model_derived_categories:
+            print(
+                "[CHEM][zero_shot] Refusing to run. Re-run with "
+                "--allow-model-derived-categories for a clearly-labelled "
+                "exploratory (circular) checkpoint evaluation."
+            )
+            sys.exit(2)
+        if not os.path.isfile(args.checkpoint):
+            print(
+                "[CHEM][zero_shot] Train-and-evaluate mode needs native "
+                "category labels; nothing to run without them."
+            )
+            sys.exit(2)
+        print("[CHEM][zero_shot] >>> EXPLORATORY / CIRCULAR - do not report as zero-shot <<<")
 
     # ---------------------------------------------------------------
     # Checkpoint mode

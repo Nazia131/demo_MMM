@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 from typing import Any, Dict, List, Optional
 
 from utils.config import get_coefficient, get_visual_concepts
@@ -64,8 +65,11 @@ class ImageEncoder:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        print(f"[CHEM][image_encoder] Loading CLIP ViT-B/32 on device={self.device} ...")
-        self._model, self._preprocess = clip.load("ViT-B/32", device=self.device)
+        # Backbone is selectable (e.g. CHEM_CLIP_MODEL="ViT-L/14") because frozen
+        # ViT-B/32 features cap Hateful Memes accuracy. Default is unchanged.
+        self.clip_model_name = os.environ.get("CHEM_CLIP_MODEL", "ViT-B/32")
+        print(f"[CHEM][image_encoder] Loading CLIP {self.clip_model_name} on device={self.device} ...")
+        self._model, self._preprocess = clip.load(self.clip_model_name, device=self.device)
         self._model.eval()
 
         # Decision threshold for calling the top concept "harmful".
@@ -137,6 +141,54 @@ class ImageEncoder:
             feats = self._model.encode_image(tensor)
             feats = feats / feats.norm(dim=-1, keepdim=True)
         return to_fixed_dim(feats.squeeze(0).detach().cpu().tolist())
+
+    # ------------------------------------------------------- learned-fusion API
+    @property
+    def concept_info(self) -> List[Dict[str, Any]]:
+        """Concept table in the column order of ``clip_features()['concept_probs']``.
+
+        Each entry has ``prompt``, ``category`` and ``harmful`` (bool).
+        """
+        return [
+            {"prompt": c["prompt"], "category": c["category"], "harmful": bool(c["harmful"])}
+            for c in self._concepts
+        ]
+
+    def clip_features(self, image: Any, caption: Optional[str] = None) -> Dict[str, Any]:
+        """Return raw CLIP features for the learned fusion head.
+
+        These are *features*, not a verdict: the concept softmax is kept as a
+        vector instead of being reduced to a thresholded harm score.
+
+        Inputs:
+            image: PIL.Image or base64 str.
+            caption: Optional caption; when given its CLIP text embedding is
+                returned too (needed for image-text interaction features).
+        Outputs:
+            ``{"image_embedding": 512 floats (L2-normalised),
+               "concept_probs": one float per concept,
+               "text_embedding": 512 floats (only if ``caption`` is not None)}``.
+        """
+        import clip
+
+        torch = self._torch
+        pil = self._to_pil(image)
+        tensor = self._preprocess(pil).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            img = self._model.encode_image(tensor)
+            img = img / img.norm(dim=-1, keepdim=True)
+            logits = self._model.logit_scale.exp() * img @ self._text_features.t()
+            probs = logits.softmax(dim=-1).squeeze(0)
+            out: Dict[str, Any] = {
+                "image_embedding": img.squeeze(0).float().cpu().tolist(),
+                "concept_probs": probs.float().cpu().tolist(),
+            }
+            if caption is not None:
+                tokens = clip.tokenize([caption or ""], truncate=True).to(self.device)
+                txt = self._model.encode_text(tokens)
+                txt = txt / txt.norm(dim=-1, keepdim=True)
+                out["text_embedding"] = txt.squeeze(0).float().cpu().tolist()
+        return out
 
     # ------------------------------------------------------------------ encode
     def encode(self, image: Any) -> Dict[str, Any]:

@@ -46,3 +46,14 @@ def test_load_samples_uses_env_default(tmp_path, monkeypatch):
 def test_missing_dir_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         list(load_hateful_memes(str(tmp_path / "nope"), "train"))
+
+
+def test_native_category_is_passed_through_but_never_invented(tmp_path):
+    rows = [
+        {"id": 1, "img": "img/1.png", "text": "a", "label": 1, "category": "hate_speech"},
+        {"id": 2, "img": "img/2.png", "text": "b", "label": 0},
+    ]
+    _write_split(tmp_path, "train.jsonl", rows)
+    samples = list(load_hateful_memes(str(tmp_path), "train"))
+    assert samples[0]["category"] == "hate_speech"
+    assert "category" not in samples[1]
