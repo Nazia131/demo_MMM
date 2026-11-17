@@ -99,24 +99,26 @@ class PrototypeHarmScorer:
     def _text_pattern_evidence(
         self,
         graph: Dict[str, Any],
+        modalities: tuple = ("text",),
     ) -> Dict[str, Any]:
 
         texts = []
 
         for node in self._get_nodes(graph):
 
-            if node.get("modality") != "text":
+            if node.get("modality") not in modalities:
                 continue
 
             # Base text node: full sentence in ``text`` (set by the API),
             # else the encoder's ``full_label`` preview.  Category nodes
             # carry no sentence, so their labels must not be mixed in.
+            # Audio nodes carry the spoken transcript in ``text``.
             value = node.get("text")
 
             if not value and node.get("label") == "text":
                 value = node.get("full_label")
 
-            if value:
+            if value and str(value) not in texts:
                 texts.append(str(value))
 
         if not texts:
@@ -669,6 +671,41 @@ class PrototypeHarmScorer:
             "audio",
             0.0,
         )
+
+        # Spoken words get the same explicit phrase checks as typed text,
+        # applied to the transcript carried on the audio nodes.  The result
+        # raises the audio score (it never lowers it) and is merged into the
+        # evidence used for the policy category / pattern list / explanation,
+        # while ``explicit_text`` below stays typed-or-OCR text only.
+        audio_evidence = (
+            self._text_pattern_evidence(
+                graph,
+                modalities=("audio",),
+            )
+        )
+
+        if audio_evidence["score"] > audio_score:
+
+            audio_score = audio_evidence["score"]
+            normalized["audio"] = audio_score
+
+        if audio_evidence["patterns"]:
+
+            text_evidence = {
+                "score": text_evidence["score"],
+                "categories": list(
+                    dict.fromkeys(
+                        text_evidence["categories"]
+                        + audio_evidence["categories"]
+                    )
+                ),
+                "patterns": list(
+                    dict.fromkeys(
+                        text_evidence["patterns"]
+                        + audio_evidence["patterns"]
+                    )
+                ),
+            }
 
         video_score = normalized.get(
             "video",
