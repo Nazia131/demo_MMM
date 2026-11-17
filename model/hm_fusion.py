@@ -330,6 +330,64 @@ def train_feature_set(
     return bundle, report
 
 
+def train_feature_set_cv(
+    blocks: Dict[str, np.ndarray],
+    labels: np.ndarray,
+    groups: np.ndarray,
+    feature_set: str,
+    meta: Dict[str, Any],
+    seed: int = SEED,
+    objective: str = "balanced_accuracy",
+    n_folds: int = 5,
+) -> Tuple[FusionBundle, Dict[str, Any]]:
+    """Select model + threshold from OUT-OF-FOLD predictions over all TRAIN rows.
+
+    A single ~15 % validation split of a few thousand memes is noisy; k-fold
+    (caption/image-grouped, stratified) gives every train row an out-of-fold
+    probability, so model choice and the threshold rest on the whole train set.
+    The scaler is refit inside each fold; the final model is refit on all train
+    rows.  Dev is never touched.
+    """
+    from sklearn.base import clone
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.preprocessing import StandardScaler
+
+    X = build_matrix(blocks, feature_set)
+    folds = list(StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed).split(X, labels, groups))
+
+    best: Optional[Tuple[float, str, Any, np.ndarray]] = None
+    tried: Dict[str, float] = {}
+    for name, est0 in _candidates(seed):
+        oof = np.zeros(len(labels))
+        for tr, te in folds:
+            set_seed(seed)
+            sc = StandardScaler().fit(X[tr])
+            est = _fit(name, clone(est0), sc.transform(X[tr]), labels[tr], seed)
+            oof[te] = est.predict_proba(sc.transform(X[te]))[:, 1]
+        auc = float(roc_auc_score(labels, oof))
+        tried[name] = auc
+        if best is None or auc > best[0]:
+            best = (auc, name, est0, oof)
+    assert best is not None
+    _, name, est0, oof = best
+
+    thr = best_threshold(labels, oof, objective)
+    report = metric_report(labels, oof, thr)
+    report.update(chosen_model=name, candidates_val_auc=tried, calibration_val=calibration_table(labels, oof),
+                  n_features=int(X.shape[1]), n_train=int(len(labels)), n_val=int(len(labels)), cv_folds=n_folds)
+
+    set_seed(seed)
+    scaler = StandardScaler().fit(X)
+    final = _fit(name, clone(est0), scaler.transform(X), labels, seed)
+    bundle = FusionBundle(
+        feature_set=feature_set, scaler=scaler, clf=final, threshold=float(thr), meta=meta,
+        info={"seed": seed, "objective": objective, "chosen_model": name, "cv_folds": n_folds,
+              "val": {k: report[k] for k in ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")}},
+    )
+    return bundle, report
+
+
 def train_all(
     data_dir: str,
     out_dir: str = DEFAULT_OUT_DIR,
@@ -337,8 +395,14 @@ def train_all(
     objective: str = "balanced_accuracy",
     limit: Optional[int] = None,
     feature_sets: Optional[Sequence[str]] = None,
+    cv_folds: int = 0,
 ) -> Dict[str, Any]:
-    """Train every baseline + the fusion model from the cached TRAIN features."""
+    """Train every baseline + the fusion model from the cached TRAIN features.
+
+    ``cv_folds >= 2`` selects model + threshold from out-of-fold predictions on
+    all train rows (see :func:`train_feature_set_cv`); otherwise a single
+    train/val split is used.
+    """
     set_seed(seed)
     path = default_cache_path(data_dir, "train", limit)
     if not os.path.isfile(path):
@@ -348,17 +412,24 @@ def train_all(
     if (labels < 0).any():
         raise ValueError("Train split contains unlabeled rows (label -1).")
 
-    train_idx, val_idx = split_train_val(labels, feats["texts"], feats["img_md5"], seed=seed)
-    assert not set(train_idx) & set(val_idx)
-    _log(f"train={len(train_idx)} (harmful {labels[train_idx].mean():.1%}) | "
-         f"val={len(val_idx)} (harmful {labels[val_idx].mean():.1%}) | dev untouched")
+    if cv_folds >= 2:
+        groups = group_ids(feats["texts"], feats["img_md5"])
+        _log(f"{cv_folds}-fold grouped CV on train={len(labels)} (harmful {labels.mean():.1%}) | dev untouched")
+    else:
+        train_idx, val_idx = split_train_val(labels, feats["texts"], feats["img_md5"], seed=seed)
+        assert not set(train_idx) & set(val_idx)
+        _log(f"train={len(train_idx)} (harmful {labels[train_idx].mean():.1%}) | "
+             f"val={len(val_idx)} (harmful {labels[val_idx].mean():.1%}) | dev untouched")
 
     os.makedirs(out_dir, exist_ok=True)
-    summary: Dict[str, Any] = {"seed": seed, "objective": objective, "sets": {}}
+    summary: Dict[str, Any] = {"seed": seed, "objective": objective, "cv_folds": cv_folds, "sets": {}}
     bundles: Dict[str, FusionBundle] = {}
     for fs in (feature_sets or FEATURE_SETS):
         _log(f"--- feature set '{fs}' ---")
-        bundle, rep = train_feature_set(feats, labels, train_idx, val_idx, fs, feats["meta"], seed, objective)
+        if cv_folds >= 2:
+            bundle, rep = train_feature_set_cv(feats, labels, groups, fs, feats["meta"], seed, objective, cv_folds)
+        else:
+            bundle, rep = train_feature_set(feats, labels, train_idx, val_idx, fs, feats["meta"], seed, objective)
         bundle.save(os.path.join(out_dir, f"{fs}.joblib"))
         bundles[fs] = bundle
         summary["sets"][fs] = rep
@@ -410,12 +481,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p_tr.add_argument("--seed", type=int, default=SEED)
     p_tr.add_argument("--objective", default="balanced_accuracy", choices=["balanced_accuracy", "f1", "accuracy"])
     p_tr.add_argument("--limit", type=int, default=None)
+    p_tr.add_argument("--cv-folds", type=int, default=0,
+                      help="k>=2: pick model + threshold from k-fold out-of-fold predictions (more stable).")
+    p_tr.add_argument("--feature-sets", nargs="+", default=None, choices=list(FEATURE_SETS),
+                      help="Train only these feature sets (faster).")
 
     args = parser.parse_args(argv)
     if args.cmd == "extract":
         _cmd_extract(args)
     else:
-        train_all(args.data_dir, args.out_dir, args.seed, args.objective, args.limit)
+        train_all(args.data_dir, args.out_dir, args.seed, args.objective, args.limit,
+                  args.feature_sets, args.cv_folds)
 
 
 if __name__ == "__main__":

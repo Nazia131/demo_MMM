@@ -178,3 +178,14 @@ def test_zero_shot_refuses_without_native_categories(tmp_path):
         _json.dumps({"id": 1, "img": "img/1.png", "text": "x", "label": 1, "category": "hate_speech"}) + "\n"
     )
     assert zs._has_native_categories(str(d)) is True
+
+
+def test_cv_selection_uses_only_train_and_yields_valid_bundle(tmp_path):
+    data_dir = tmp_path / "hm"
+    (data_dir / ".cache").mkdir(parents=True)
+    _write_cache(data_dir / ".cache" / "hm_features_train.npz", 300, seed=41)
+    summary = fu.train_all(str(data_dir), str(tmp_path / "b"), seed=2, feature_sets=["text"], cv_folds=3)
+    rep = summary["sets"]["text"]
+    assert rep["cv_folds"] == 3 and rep["n_val"] == 300
+    assert rep["roc_auc"] > 0.75 and 0.05 <= rep["threshold"] <= 0.95
+    assert fu.FusionBundle.load(str(tmp_path / "b" / "final.joblib")).info["cv_folds"] == 3
