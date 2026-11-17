@@ -1,0 +1,4 @@
+id,text,image,audio,expected,note
+t1,I will kill you,,,HARMFUL,SAMPLE ROW - direct threat. Replace with your own cases
+t2,nice weather today,,,SAFE,SAMPLE ROW - benign
+t3,he is contacting you tonight about the factory,,,SAFE,SAMPLE ROW - benign text containing old substring-bug words
