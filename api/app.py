@@ -631,7 +631,7 @@ class CHEMPipeline:
         # prototype).  Policy patterns below remain auxiliary evidence only.
         if (
             self.fusion is not None
-            and text
+            and (text or ocr_text)
             and pil_for_fusion is not None
             and audio_path is None
             and video_path is None
@@ -639,8 +639,10 @@ class CHEMPipeline:
             try:
                 from model.hm_features import extract_one
 
+                # Hateful-Memes captions are the text printed on the meme, so
+                # when the user typed none, the OCR'd text is the right input.
                 blocks = extract_one(
-                    text,
+                    text or ocr_text,
                     pil_for_fusion,
                     self.text_encoder,
                     self.image_encoder,

@@ -189,3 +189,23 @@ def test_cv_selection_uses_only_train_and_yields_valid_bundle(tmp_path):
     assert rep["cv_folds"] == 3 and rep["n_val"] == 300
     assert rep["roc_auc"] > 0.75 and 0.05 <= rep["threshold"] <= 0.95
     assert fu.FusionBundle.load(str(tmp_path / "b" / "final.joblib")).info["cv_folds"] == 3
+
+
+def test_bundle_saved_from_main_module_loads_elsewhere(tmp_path):
+    """`python -m model.hm_fusion train` pickles the class as __main__.FusionBundle."""
+    import sys
+
+    b = fu.FusionBundle.__new__(fu.FusionBundle)
+    b.__dict__.update(scaler=None, clf=None, threshold=0.5, meta={}, info={}, feature_set="text")
+    path = str(tmp_path / "m.joblib")
+    orig = fu.FusionBundle.__module__
+    fu.FusionBundle.__module__ = "__main__"
+    sys.modules["__main__"].FusionBundle = fu.FusionBundle
+    try:
+        import joblib
+
+        joblib.dump(b, path)
+    finally:
+        fu.FusionBundle.__module__ = orig
+        delattr(sys.modules["__main__"], "FusionBundle")
+    assert fu.FusionBundle.load(path).threshold == 0.5
