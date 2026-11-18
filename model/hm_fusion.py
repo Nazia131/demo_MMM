@@ -271,9 +271,22 @@ class FusionBundle:
     @staticmethod
     def load(path: str) -> "FusionBundle":
         """Load a bundle. Uses pickle: only load files you created yourself."""
+        import sys
+
         import joblib
 
-        return joblib.load(path)
+        # Bundles written by `python -m model.hm_fusion train` record their class
+        # as `__main__.FusionBundle`. Under uvicorn/pytest `__main__` is another
+        # module, so make that name resolve to this class for the duration of the load.
+        main = sys.modules.get("__main__")
+        had = hasattr(main, "FusionBundle")
+        if main is not None and not had:
+            main.FusionBundle = FusionBundle
+        try:
+            return joblib.load(path)
+        finally:
+            if main is not None and not had:
+                delattr(main, "FusionBundle")
 
 
 # --------------------------------------------------------------------------- #
